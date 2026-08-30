@@ -1,0 +1,74 @@
+mipi_camera_node:
+  ros__parameters:
+    camera_path: "/dev/video11"
+    fps: 30
+    image_width: 640
+    image_height: 480
+    image_topic: "/camera/mipi/image_raw"
+    prefer_mipi: true
+
+usb_camera_node:
+  ros__parameters:
+    camera_path: "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
+    fps: 30
+    image_width: 640
+    image_height: 480
+    image_topic: "/camera/usb/image_raw"
+    prefer_mipi: false
+
+perception_node:
+  ros__parameters:
+    image_topic: "/camera/usb/image_raw"
+    # robust_center | legacy_width_barrier；也可用 launch 参数 tracking_mode 覆盖。
+    road_tracking.mode: "robust_center"
+    preview.near.row_ratio: 0.80
+    preview.near.edge_margin_px: 10
+    # 最新 crossroad_mask_03 的当前相机尺度；旧提交原值为 422/384/450。
+    preview.near.expected_width: 290
+    preview.near.min_width: 250
+    preview.near.max_width: 330
+    preview.far.row_ratio: 0.40
+    preview.far.edge_margin_px: 10
+    # 旧提交原值为 238/208/268，与当前 Mask 透视尺度不符。
+    preview.far.expected_width: 86
+    preview.far.min_width: 70
+    preview.far.max_width: 110
+    road_tracking.max_inline_gap_px: 8
+    road_tracking.min_run_width_px: 12
+    road_tracking.boundary_jump_px: 36
+    road_tracking.reconnect_tolerance_px: 20
+    road_tracking.reconnect_rows: 2
+    road_tracking.local_fit_points: 10
+    # 绿色控制线：近处候选点鲁棒拟合，不再逐行跟随左右轮廓。
+    road_tracking.center_fit_top_ratio: 0.72
+    road_tracking.center_fit_bottom_ratio: 0.90
+    road_tracking.center_edge_margin_px: 10
+    road_tracking.center_min_width_px: 40
+    road_tracking.center_min_points: 30
+    road_tracking.center_inlier_px: 8
+    road_tracking.center_min_inlier_ratio: 0.60
+    road_tracking.center_hold_frames: 4
+    road_tracking.center_smoothing: 0.35
+    road_tracking.center_max_jump_px: 50
+    road_tracking.center_max_slope_jump: 0.35
+    road_tracking.center_max_abs_slope: 0.35
+    road_tracking.legacy_overlap_margin_px: 14
+    road_tracking.legacy_max_missing_rows: 6
+    road_tracking.legacy_boundary_stable_px: 45
+    road_tracking.legacy_bottom_seed_ratio: 0.85
+    road_tracking.legacy_use_barrier_gap: true
+
+mission_node:
+  ros__parameters:
+    turn_penalty: 0.5
+    u_turn_penalty: 1.0
+    tunnel_risk: 0.0
+    recon_target: 8
+    obstacle_mode: "bidirectional"
+
+serial_node:
+  ros__parameters:
+    serial_device: "/dev/ttyS6"
+    deviation_rate_hz: 30.0
+    deviation_timeout_ms: 150
+    baud_rate: 115200

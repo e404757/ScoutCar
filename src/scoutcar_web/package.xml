@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scoutcar_web</name>
+  <version>0.1.0</version>
+  <description>scoutcar 应用层包：web_node 网页推流 + 录像回放/导出（对应原工程 main/web_server.cc + recorder/video_writer）</description>
+  <maintainer email="orangepi@example.com">orangepi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>scoutcar_msgs</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+</package>

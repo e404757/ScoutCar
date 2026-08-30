@@ -1,0 +1,23 @@
+# web_node 参数
+# 订阅面：与 perception_node 默认一致（看模型所见），launch 里可覆盖
+web_node:
+  ros__parameters:
+    port: 8080
+    # 网页端可切换的推流相机（web 页面上有 USB/MIPI 切换按钮）
+    camera_topics: ["/camera/usb/image_raw", "/camera/mipi/image_raw"]
+    # 掩膜/边界叠加只作用于"感知实际处理的那路相机"（当前感知走 USB）
+    overlay_topic: /camera/usb/image_raw
+    seg_topic: /perception/seg_mask
+    boundary_topic: /perception/road_boundary
+    source_topic: /perception/source_image
+    debug_topic: /perception/debug_image
+    # true：直接显示 perception 同帧绘制好的画面，不在 Web 端配对 Mask 和 RGB
+    use_local_debug: true
+    status_topic: /mission/status
+    # 录像：一个按钮起停；每段同步录 原始.avi + 叠加_mask.avi（帧号对齐）
+    record_dir: /home/orangepi/CityScout/data/record
+    record_fps: 30
+    record_enable: true
+    # 补标导出目录（暂停在某帧 → 导出本帧 JPEG，供 labelImg 补标）
+    label_dir: /home/orangepi/CityScout/data/label_export
+    jpg_quality: 85

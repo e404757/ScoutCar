@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scoutcar_perception</name>
+  <version>0.1.0</version>
+  <description>scoutcar 感知层包：perception_node（yolov5_seg 分割，detection 预留）</description>
+  <maintainer email="orangepi@example.com">orangepi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>ament_index_cpp</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>scoutcar_msgs</depend>
+</package>

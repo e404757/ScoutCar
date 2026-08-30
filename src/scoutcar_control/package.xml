@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scoutcar_control</name>
+  <version>0.1.0</version>
+  <description>scoutcar 驱动层包：serial_node 串口驱动节点（对应原工程 control/）</description>
+  <maintainer email="orangepi@example.com">orangepi</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>scoutcar_msgs</depend>
+</package>
