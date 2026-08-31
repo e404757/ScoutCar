@@ -1,19 +1,14 @@
 #pragma once
 
 // 网页前端（内嵌，编译期打包，与原工程 web_server.cc 的 HTML 内嵌思路一致）
-// 两个页签：
-//   实时画面 —— MJPEG 推流 + 一个录像按钮（用户需求：一个按钮起停）
-//   录像回放 —— 完整播放器（播放/暂停/进度条/逐帧）+ 导出本帧补标
-//
-// 回放实现：服务端按帧号出 JPEG（/frame?file=base&idx=N&kind=mask），
-// 播放器逐帧取图（本地局域网，640x480 JPEG 每帧几十 KB，足够流畅），
-// 天然支持暂停/拖动/逐帧，无进度条精度损失。
+// 实时画面：MJPEG 推流 + 相机切换 + 一个录像按钮 + 状态侧边面板。
+// 录像回放与补标导出已移至 Windows 标注平台，车端只保留录制。
 
 static const char * kPageHtml = R"HTML(<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="utf-8">
-  <title>scoutcar 实时画面 / 录像回放</title>
+  <title>scoutcar 实时画面</title>
   <style>
     body { background:#111; color:#eee; font-family:Arial, sans-serif; margin:0; }
     .tabbar { background:#1a1a1a; padding:10px 16px; border-bottom:1px solid #333; }
@@ -54,17 +49,23 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
                        padding:4px 12px; margin-right:6px; cursor:pointer; font-size:13px; }
     #cam-btns button.on { background:#2a7; color:#fff; border-color:#2a7; }
     #cam-btns button.nosig { opacity:.55; }
+    .panel { background:#181818; border:1px solid #333; border-radius:8px;
+             padding:10px 14px; min-width:230px; font-size:13px; }
+    .panel-sec { margin-bottom:12px; }
+    .panel-sec:last-child { margin-bottom:0; }
+    .panel-title { color:#2a7; font-weight:bold; margin-bottom:6px; font-size:13px; }
+    .kv { line-height:1.8; color:#ccc; white-space:pre-line; }
+    .kv b { color:#eee; }
+    .good { color:#4d8; } .warn { color:#fc4; } .bad { color:#f66; }
+    #width-chart { width:230px; height:105px; background:#101010;
+                   border:1px solid #333; border-radius:4px; }
+    .legend { color:#888; font-size:11px; margin-top:3px; }
   </style>
 </head>
 <body>
-<div class="tabbar">
-  <button id="tabbtn-live" class="on" onclick="switchTab('live')">实时画面</button>
-  <button id="tabbtn-replay" onclick="switchTab('replay')">录像回放</button>
-</div>
-
 <!-- ══════════ 实时画面 ══════════ -->
 <div id="tab-live" class="tab">
-  <h2>实时画面（叠加：掩膜 / 边界 / 任务状态）</h2>
+  <h2>实时画面<span style="font-size:13px;color:#aaa;margin-left:10px">感知相机显示同帧叠加（掩膜/边界），状态与调试数值见右侧面板</span></h2>
   <div class="status">
     <span class="dot" id="rec-dot"></span>
     <span id="rec-text">录像未开始</span>
@@ -75,37 +76,36 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
     <span style="color:#aaa;font-size:13px">相机：</span>
     <span id="cam-btns"></span>
   </div>
-  <img class="live" src="/video_feed" alt="实时画面">
-</div>
-
-<!-- ══════════ 录像回放 ══════════ -->
-<div id="tab-replay" class="tab" style="display:none">
-  <h2>录像回放与补标导出</h2>
-  <div class="status">回放的是带掩膜的叠加画面（xxx_mask.avi），肉眼找"模型没分割好"的弱帧；
-    导出时从原始文件抽同一帧（干净画面）存 JPEG 到补标目录。</div>
-  <div id="reclist"></div>
-  <div id="player" style="display:none">
-    <img id="pimg" width="640" alt="回放帧">
-    <div class="pctl">
-      <button class="main" id="playbtn" onclick="togglePlay()">播放</button>
-      <button onclick="step(-10)">«10</button>
-      <button onclick="step(-1)">‹</button>
-      <button onclick="step(1)">›</button>
-      <button onclick="step(10)">10»</button>
-      <button class="export" onclick="exportFrame('raw')">导出本帧(原始·补标)</button>
-      <button class="exportm" onclick="exportFrame('mask')">导出本帧(叠加)</button>
-      <span id="toast"></span>
+  <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
+    <img class="live" src="/video_feed" alt="实时画面" style="max-width:640px">
+    <div id="infopanel" class="panel">
+      <div class="panel-sec">
+        <div class="panel-title">任务状态</div>
+        <div id="mi-mission" class="kv">等待数据…</div>
+      </div>
+      <div class="panel-sec">
+        <div class="panel-title">道路边界</div>
+        <div id="mi-boundary" class="kv">等待数据…</div>
+      </div>
+      <div class="panel-sec">
+        <div class="panel-title">宽度历史（最近 10 秒）</div>
+        <canvas id="width-chart" width="230" height="105"></canvas>
+        <div class="legend">原始 <span style="color:#fc4">━</span>　修正 <span style="color:#4d8">━</span>　范围 <span style="color:#777">━</span></div>
+      </div>
+      <div class="panel-sec">
+        <div class="panel-title">系统</div>
+        <div id="mi-sys" class="kv"></div>
+      </div>
     </div>
-    <input type="range" id="slider" min="0" max="0" value="0" step="1"
-           oninput="onSlider()">
-    <div class="frameinfo">帧 <span id="cur">0</span> / <span id="total">0</span>
-      &nbsp;·&nbsp; <span id="finfo"></span></div>
   </div>
 </div>
 
+
 <script>
 // ══════════ 实时页 ══════════
-let recState = { record_enable: false, recording: false, fps: 0 };
+let recState = { record_enable: false, recording: false, bag_enable: false, bag_recording: false, fps: 0 };
+let widthHistory = [];
+let lastBoundaryStamp = '';
 
 async function refreshStatus() {
   try {
@@ -127,10 +127,88 @@ async function refreshStatus() {
     btn.className = recState.recording ? 'recbtn rec' : 'recbtn idle';
     btn.textContent = recState.recording ? '■ 停止录像' : '● 开始录像';
     dot.className = 'dot ' + (recState.recording ? 'on' : '');
-    txt.textContent = recState.recording ? '录像中（原始 + 叠加双文件）' : '录像未开始';
+    if (recState.recording) {
+      txt.textContent = recState.bag_enable
+        ? (recState.bag_recording ? '录像中（双 AVI + rosbag）' : '录像中（rosbag 启动失败）')
+        : '录像中（原始 + 叠加双文件）';
+    } else {
+      txt.textContent = '录像未开始';
+    }
   }
   info.textContent = recState.fps > 0 ? ('推流 ' + recState.fps.toFixed(1) + ' fps') : '';
   renderCameras();
+  renderInfoPanel();
+  updateWidthHistory();
+  drawWidthChart();
+}
+
+// 侧边信息面板：任务状态 / 道路边界 / 系统（数值来自 /api/status，不再画在图上）
+function renderInfoPanel() {
+  const m = recState.mission || {};
+  const b = recState.boundary || {};
+  const turning = m.driving_state === 'TURNING';
+  let mh = '状态　<b class="' + (turning ? 'warn' : 'good') + '">' +
+           (turning ? '转向中' : '正常') + '</b>';
+  document.getElementById('mi-mission').innerHTML = mh;
+
+  let bh;
+  if (!b.online) {
+    bh = '<span style="color:#766">离线 / 无数据</span>';
+  } else {
+    const ws = b.width_status || 'NO_WIDTH';
+    const wc = ws === 'NORMAL' ? 'good' : (ws === 'TOO_WIDE' ? 'warn' : 'bad');
+    const algorithmText = b.algorithm_valid ? '<span class="good">VALID</span>' : '<span class="bad">INVALID / -999</span>';
+    const controlText = b.control_ready
+      ? '<span class="good">已启用　输出 ' + signed(b.deviation) + '</span>'
+      : '<span class="warn">未启用　输出 -999</span>';
+    bh = '预瞄　<b>' + (b.preview_mode || '—') + '</b>　y=' + (b.scan_y ?? '—') + '　pt=' + fmt(b.selected_pt, 2) +
+         '\n来源　<b>' + (b.boundary_source || '—') + '</b>' +
+         '\n\n道路边界　<b>' + val(b.left) + ' / ' + val(b.right) + '</b>' +
+         '\n道路宽度　<b>' + val(b.width) + ' px</b>' +
+         '\n允许范围　<b>' + val(b.min_width) + ' ~ ' + val(b.max_width) + ' px</b>' +
+         '\n宽度状态　<span class="' + wc + '"><b>' + ws + '</b></span>' +
+         '\n\n道路中心　<b>' + val(b.road_center) + ' px</b>' +
+         '\n算法偏差　<b>' + signed(b.algorithm_deviation) + '</b>' +
+         '\n算法状态　' + algorithmText +
+         '\n控制状态　' + controlText;
+  }
+  document.getElementById('mi-boundary').innerHTML = bh;
+
+  document.getElementById('mi-sys').innerHTML =
+    '感知帧率　<b>' + (recState.fps > 0 ? recState.fps.toFixed(1) + ' fps' : '—') + '</b>' +
+    '\n录像目录　' + (recState.record_dir || '—');
+}
+
+function val(v) { return (v === undefined || v === null || v < 0) ? '—' : v; }
+function fmt(v, n) { return Number.isFinite(Number(v)) ? Number(v).toFixed(n) : '—'; }
+function signed(v) { return v === undefined ? '—' : ((v > 0 ? '+' : '') + v); }
+
+function updateWidthHistory() {
+  const b = recState.boundary || {};
+  if (!b.online || !b.width) return;
+  const key = [b.width,b.deviation,b.scan_y,Date.now() >> 8].join(':');
+  if (key === lastBoundaryStamp) return;
+  lastBoundaryStamp = key;
+  widthHistory.push({t:Date.now(), raw:b.width, fixed:b.width,
+                     min:b.min_width, max:b.max_width});
+  const cutoff = Date.now() - 10000;
+  widthHistory = widthHistory.filter(p => p.t >= cutoff).slice(-80);
+}
+
+function drawWidthChart() {
+  const c=document.getElementById('width-chart'),ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if(widthHistory.length<2) return;
+  let values=[]; for(const p of widthHistory) values.push(p.raw,p.fixed,p.min,p.max);
+  const lo=Math.max(0,Math.min(...values)-20), hi=Math.max(lo+1,Math.max(...values)+20);
+  const t0=Date.now()-10000, x=t=>((t-t0)/10000)*c.width;
+  const y=v=>c.height-((v-lo)/(hi-lo))*(c.height-8)-4;
+  function line(field,color,width) {
+    ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=width;
+    widthHistory.forEach((p,i)=>{const px=x(p.t),py=y(p[field]);i?ctx.lineTo(px,py):ctx.moveTo(px,py);});ctx.stroke();
+  }
+  line('min','#555',1);line('max','#555',1);line('raw','#fc4',2);line('fixed','#4d8',2);
+  ctx.fillStyle='#888';ctx.font='10px Arial';ctx.fillText(Math.round(hi),2,10);ctx.fillText(Math.round(lo),2,c.height-3);
 }
 
 // 渲染相机切换按钮（来自 /api/status 的 cameras）
@@ -143,8 +221,9 @@ function renderCameras() {
     const name = c.topic.replace('/camera/', '').replace('/image_raw', '');
     const cls = c.selected ? ' on' : '';
     const nosig = c.has_frame ? '' : ' nosig';
+    const mark = c.overlay ? '（叠加）' : '（原始）';
     html += '<button class="' + cls.trim() + nosig + '" onclick="switchCam(\'' + c.topic + '\')">' +
-            name + (c.has_frame ? '' : ' (无信号)') + '</button>';
+            name + mark + (c.has_frame ? '' : ' ·无信号') + '</button>';
   }
   box.innerHTML = html;
 }
@@ -165,122 +244,13 @@ async function toggleRecord() {
     await fetch('/api/record/' + (on ? 'stop' : 'start'), { method: 'POST' });
     if (!on) { await sleep(200); }   // 等片段创建
     await refreshStatus();
-    if (!on) { await loadRecordings(); }   // 新片段出现，刷新列表
-  } catch (e) {}
-}
-
-// ══════════ 回放页 ══════════
-const P = { base: null, info: null, idx: 0, playing: false, timer: null };
-
-function switchTab(name) {
-  document.getElementById('tab-live').style.display = name === 'live' ? '' : 'none';
-  document.getElementById('tab-replay').style.display = name === 'replay' ? '' : 'none';
-  document.getElementById('tabbtn-live').classList.toggle('on', name === 'live');
-  document.getElementById('tabbtn-replay').classList.toggle('on', name === 'replay');
-  if (name === 'replay') { loadRecordings(); pause(); }
-}
-
-async function loadRecordings() {
-  let list = [];
-  try {
-    const r = await fetch('/api/recordings');
-    list = await r.json();
-  } catch (e) {}
-  const box = document.getElementById('reclist');
-  if (!list.length) {
-    box.innerHTML = '<div class="status">暂无录像片段（在"实时画面"页点击开始录像）</div>';
-    document.getElementById('player').style.display = 'none';
-    return;
-  }
-  let html = '';
-  for (const s of list) {
-    const sel = P.base === s.base ? ' sel' : '';
-    html += '<button class="reccell' + sel + '" onclick="openSegment(\'' + s.base + '\')">' +
-            s.base + '　' + s.frames + ' 帧 @ ' + s.fps.toFixed(1) + 'fps　' +
-            s.width + 'x' + s.height + '</button>';
-  }
-  box.innerHTML = html;
-}
-
-async function openSegment(base) {
-  try {
-    const r = await fetch('/api/segment_info?file=' + base);
-    const info = await r.json();
-    if (!info.ok) { alert('无法打开片段 ' + base); return; }
-    P.base = base; P.info = info; P.idx = 0; pause();
-    document.getElementById('slider').max = info.frames - 1;
-    document.getElementById('finfo').textContent =
-      info.frames + ' 帧 / ' + info.fps.toFixed(1) + ' fps / ' + info.width + 'x' + info.height;
-    document.getElementById('player').style.display = '';
-    loadRecordings();   // 高亮当前
-    showFrame();
-  } catch (e) {}
-}
-
-function showFrame() {
-  if (!P.info) return;
-  const n = P.info.frames;
-  if (n <= 0) return;
-  if (P.idx < 0) P.idx = 0;
-  if (P.idx > n - 1) P.idx = n - 1;
-  const img = document.getElementById('pimg');
-  img.src = '/frame?file=' + P.base + '&idx=' + P.idx + '&kind=mask&t=' + Date.now();
-  document.getElementById('cur').textContent = P.idx;
-  document.getElementById('total').textContent = n - 1;
-  document.getElementById('slider').value = P.idx;
-}
-
-function togglePlay() {
-  if (P.playing) { pause(); } else { play(); }
-}
-
-function play() {
-  if (!P.info || P.info.frames < 2) return;
-  P.playing = true;
-  document.getElementById('playbtn').textContent = '暂停';
-  const ms = Math.max(20, Math.round(1000 / P.info.fps));
-  P.timer = setInterval(() => {
-    if (P.idx >= P.info.frames - 1) { pause(); return; }
-    P.idx++;
-    showFrame();
-  }, ms);
-}
-
-function pause() {
-  P.playing = false;
-  if (P.timer) { clearInterval(P.timer); P.timer = null; }
-  document.getElementById('playbtn').textContent = '播放';
-}
-
-function step(d) {
-  if (!P.info) return;
-  if (P.playing) pause();           // 手动逐帧时暂停
-  P.idx += d;
-  showFrame();
-}
-
-function onSlider() {
-  if (!P.info) return;
-  P.idx = parseInt(document.getElementById('slider').value, 10);
-  showFrame();
-}
-
-async function exportFrame(kind) {
-  if (!P.base) return;
-  if (P.playing) pause();
-  try {
-    const r = await fetch('/api/export?file=' + P.base + '&idx=' + P.idx + '&kind=' + kind,
-                          { method: 'POST' });
-    const j = await r.json();
-    const toast = document.getElementById('toast');
-    toast.textContent = j.ok ? ('已导出 → ' + j.path) : ('导出失败: ' + (j.reason || ''));
   } catch (e) {}
 }
 
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
 refreshStatus();
-setInterval(refreshStatus, 1000);
+setInterval(refreshStatus, 250);
 </script>
 </body>
 </html>

@@ -11,7 +11,7 @@ void DualRecorder::configure(const std::string & record_dir, int fps)
   fps_ = fps;
 }
 
-bool DualRecorder::start()
+bool DualRecorder::start(int fps)
 {
   if (active_.load()) {
     return false;   // 已在录制
@@ -20,6 +20,7 @@ bool DualRecorder::start()
     printf("[recorder] record_dir 未配置，无法开始录像\n");
     return false;
   }
+  if (fps > 0) fps_ = fps;
 
   // 时间戳 base：record_YYYYmmdd_HHMMSS
   time_t now = time(nullptr);

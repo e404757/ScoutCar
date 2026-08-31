@@ -8,7 +8,6 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     config_file = LaunchConfiguration("config_file")
     log_level = LaunchConfiguration("log_level")
-    tracking_mode = LaunchConfiguration("tracking_mode")
 
     default_config = PathJoinSubstitution(
         [FindPackageShare("scoutcar_bringup"), "config", "cityscout.yaml"]
@@ -32,11 +31,6 @@ def generate_launch_description():
                 default_value="info",
                 description="ROS 日志级别",
             ),
-            DeclareLaunchArgument(
-                "tracking_mode",
-                default_value="robust_center",
-                description="road tracker: robust_center or legacy_width_barrier",
-            ),
             Node(
                 package="scoutcar_camera",
                 executable="camera_node",
@@ -53,7 +47,7 @@ def generate_launch_description():
                 package="scoutcar_perception",
                 executable="perception_node",
                 name="perception_node",
-                parameters=[config_file, {"road_tracking.mode": tracking_mode}],
+                parameters=[config_file],
                 output="screen",
                 arguments=["--ros-args", "--log-level", log_level],
             ),

@@ -4,24 +4,19 @@ bool valid
 int16 deviation
 uint16 road_center
 uint16 scan_y
-int16 raw_left
-int16 raw_right
-uint16 fit_top_y
-uint16 fit_bottom_y
-bool left_reconstructed
-bool right_reconstructed
-int16[] raw_left_boundary
-int16[] raw_right_boundary
-int16[] fitted_left_boundary
-int16[] fitted_right_boundary
-uint8[] left_repaired
-uint8[] right_repaired
+int16 left
+int16 right
 
-# 真正用于控制的鲁棒中心直线，x = center_slope*y + center_intercept。
-int16[] center_boundary
-float32 center_slope
-float32 center_intercept
-float32 center_confidence
-uint16 center_candidate_count
-uint16 center_inlier_count
-bool center_predicted
+# Web 调参诊断：均为算法本帧实际采用的数据，不由 Web 推测。
+string preview_mode
+float32 selected_pt
+uint16 width
+uint16 min_width
+uint16 max_width
+string width_status
+string boundary_source
+
+# 算法诊断与控制门控分离：任务离线时算法结果仍可在 Web 正常显示。
+bool algorithm_valid
+int16 algorithm_deviation
+bool control_ready

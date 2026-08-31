@@ -27,7 +27,7 @@ public:
 
   // 开始新片段：生成 base 名（record_YYYYmmdd_HHMMSS）并置 active。
   // 两个 writer 延迟到第一帧写入时按帧尺寸惰性创建（尺寸来自相机实际帧）。
-  bool start();
+  bool start(int fps);
   // 封存当前片段（写空剩余帧 + 关闭文件）。
   void stop();
   bool active() const { return active_.load(); }
@@ -44,7 +44,7 @@ private:
   void ensureWriters(int width, int height);
 
   std::string record_dir_;
-  int fps_ = 30;
+  int fps_ = 20;
   std::atomic<bool> active_{false};
   std::string base_;
   std::string raw_path_;

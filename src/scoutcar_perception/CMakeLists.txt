@@ -60,21 +60,17 @@ target_include_directories(yolov5_seg PRIVATE
 target_link_libraries(yolov5_seg PUBLIC imageutils fileutils)
 
 add_library(road_tracking STATIC
-    vendor/road_boundary/road_boundary.cc
-    vendor/road_tracking/road_tracker.cc
-    vendor/road_tracking/legacy_width_tracker.cc
+    src/road_tracker.cpp
 )
 target_include_directories(road_tracking PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/road_boundary
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/road_tracking
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
 # ── 感知节点：收 /camera/image_raw → 推理 → 发 /perception/seg_mask ──
 add_executable(perception_node src/perception_node.cpp)
 target_include_directories(perception_node PRIVATE ${RKNN_INCLUDES})
 target_include_directories(perception_node PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/road_boundary
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/road_tracking
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 ament_target_dependencies(perception_node ament_index_cpp rclcpp sensor_msgs std_msgs scoutcar_msgs)
 target_link_libraries(perception_node
@@ -83,6 +79,13 @@ target_link_libraries(perception_node
     ${LIBRKNNRT}
     pthread
     dl
+)
+# imageutils 静态链接了 vendored libturbojpeg.a，其 jpeg_* 符号默认会被导出到
+# 可执行文件的动态符号表，导致 OpenCV imgcodecs 运行时错误绑定到这套 ABI
+# 不兼容的实现（cv::imencode 内 jpeg_CreateCompress 段错误，2026-08-30）。
+# --exclude-libs 阻止导出，符号仅供静态链接内部使用。
+target_link_options(perception_node PRIVATE
+    "LINKER:--exclude-libs,libturbojpeg.a"
 )
 
 install(TARGETS perception_node
