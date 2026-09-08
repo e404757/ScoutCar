@@ -4,30 +4,18 @@
 web_node:
   ros__parameters:
     port: 8080
-    # 网页端可切换的推流相机（页面上有 USB/MIPI 切换按钮）
-    camera_topics: ["/camera/usb/image_raw", "/camera/mipi/image_raw"]
-    # 感知实际处理的那路相机（当前感知走 USB）；该路显示叠加画面
-    overlay_topic: /camera/usb/image_raw
-    source_topic: /perception/source_image
-    debug_topic: /perception/debug_image
-    # 道路边界数值（网页侧边状态面板展示，不画在图上）
-    boundary_topic: /perception/road_boundary
-    status_topic: /mission/status
-    deviation_enable_topic: /mission/deviation_enable
+    
     # 录像：一个按钮起停；每段同步录 原始.avi + 叠加_mask.avi（帧号对齐）。
     # 片段留在 record_dir；回放/补标导出在 Windows 标注平台进行。
     record_dir: /home/orangepi/CityScout/data/record
     # 0=按实际感知帧率建档，避免处理只有约 20 FPS 时按 30 FPS 加速播放。
     record_fps: 0
-    record_enable: true
-    # 同一个网页按钮附带录制轻量 rosbag；彩色原图和叠加图仍只存 AVI。
-    bag_enable: true
+    # 同一个网页按钮同时录制双 AVI 与轻量 rosbag。
     bag_dir: /home/orangepi/CityScout/data/bags
     bag_topics:
       - /perception/seg_mask
       - /perception/road_boundary
       - /mission/deviation_enable
-      - /mission/status
       - /mission/path_cmd
       - /mcu/rx_event
     jpg_quality: 85

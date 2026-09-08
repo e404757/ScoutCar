@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- CycloneDDS 调优:相机 921KB 大帧按默认小分片传输会产生海量 UDP 报文,
+     导致传输速率随时间衰减(2026-08-30 排查 web 画面卡顿)。
+     加大分片上限,配合系统级 8MB socket 缓冲(sysctl.d/99-scoutcar-dds.conf)。 -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <FragmentSize>65000B</FragmentSize>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize min="8MB"/>
+    </Internal>
+  </Domain>
+</CycloneDDS>

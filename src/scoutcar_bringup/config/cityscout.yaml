@@ -18,30 +18,30 @@ usb_camera_node:
 
 perception_node:
   ros__parameters:
-    image_topic: "/camera/usb/image_raw"
-    preview.near.row_ratio: 0.80
-    preview.near.edge_margin_px: 10
-    # 最新 crossroad_mask_03 的当前相机尺度。
-    preview.near.min_width: 384
-    preview.near.max_width: 450
-    preview.far.row_ratio: 0.40
-    preview.far.edge_margin_px: 10
-    # 当前 Mask 的远处透视尺度。
-    preview.far.min_width: 208
-    preview.far.max_width: 268
-    road_tracking.max_inline_gap_px: 8
-    road_tracking.min_run_width_px: 12
-    road_tracking.overlap_margin_px: 14
-    road_tracking.max_missing_rows: 6
-    road_tracking.bottom_seed_ratio: 0.85
-    road_tracking.use_barrier_gap: true
+    usb_image_topic: "/camera/usb/image_raw"
+    mipi_image_topic: "/camera/mipi/image_raw"
+    ipm.mipi_source_points: [219.0, 190.0, 412.0, 190.0, 65.0, 440.0, 559.0, 440.0]
+    ipm.usb_source_points: [255.0, 240.0, 489.0, 240.0, 207.0, 440.0, 627.0, 440.0]
+    ipm.destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
+    # 以下宽度和偏差都在 640x480 俯视图中，近处和远处使用同一尺度。
+    road_tracking.scan_end_y: 120
+    road_tracking.min_road_width_px: 225
+    road_tracking.max_road_width_px: 285
+    road_tracking.min_barrier_width_px: 12
+    road_tracking.search_expand_px: 20
+    road_tracking.min_valid_rows: 60
+
+visualizer_node:
+  ros__parameters:
+    ipm.mipi_source_points: [219.0, 190.0, 412.0, 190.0, 65.0, 440.0, 559.0, 440.0]
+    ipm.usb_source_points: [255.0, 240.0, 489.0, 240.0, 207.0, 440.0, 627.0, 440.0]
+    ipm.destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
 
 mission_node:
   ros__parameters:
     turn_penalty: 0.5
     u_turn_penalty: 1.0
     tunnel_risk: 0.0
-    recon_target: 8
     obstacle_mode: "bidirectional"
 
 serial_node:

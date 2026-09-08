@@ -1,195 +1,204 @@
 #include "scoutcar_perception/road_tracker.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace road_tracking {
 namespace {
-struct Run { int left; int right; bool from_barrier = false; };
 
-int center(const Run & run) { return (run.left + run.right) / 2; }
+struct Snack {
+  int start_x;
+  int end_x;
+  int length;
+};
 
-int overlap(const Run & a, const Run & b, int margin) {
-  return std::max(0, std::min(a.right + margin, b.right) -
-                     std::max(a.left - margin, b.left) + 1);
+struct TrackedSnack {
+  Snack snack;
+  int y;
+  bool used_barrier_gap;
+};
+
+Snack greedy_snack(int start_x, int width, const uint8_t * row) {
+  Snack snack{start_x, start_x, 1};
+  const uint8_t target_value = row[static_cast<size_t>(start_x)];
+
+  for (int x = start_x + 1; x < width; ++x) {
+    if (row[static_cast<size_t>(x)] != target_value) {
+      break;
+    }
+    ++snack.length;
+    snack.end_x = x;
+  }
+
+  return snack;
 }
 
-std::vector<Run> find_road_runs(const uint8_t * row, int width, const Config & config) {
-  std::vector<Run> runs;
-  int left = -1;
-  int last = -1;
-  for (int x = 0; x < width; ++x) {
-    if (row[x] != 1) continue;
-    if (left < 0) left = last = x;
-    else if (x - last - 1 <= config.max_inline_gap_px) last = x;
-    else {
-      if (last - left + 1 >= config.min_run_width_px) runs.push_back({left, last});
-      left = last = x;
+bool check_snack(const Snack & snack, int min_width, int max_width) {
+  return snack.length >= min_width && snack.length <= max_width;
+}
+
+Snack find_best_snack(const uint8_t * row,
+                      int search_start_x,
+                      int search_end_x,
+                      int reference_center,
+                      const Config & config,
+                      bool & used_barrier_gap) {
+  std::vector<Snack> road_snacks;
+  std::vector<Snack> barrier_snacks;
+
+  used_barrier_gap = false;
+
+  for (int x = search_start_x; x <= search_end_x; ++x) {
+    const uint8_t value = row[static_cast<size_t>(x)];
+    if (value == 0) {
+      continue;
+    }
+
+    const Snack snack = greedy_snack(x, search_end_x + 1, row);
+    x += snack.length - 1;
+
+    if (value == 1) {
+      road_snacks.push_back(snack);
+    } else if (value == 2 &&//过滤掉过窄的挡板
+               snack.length >= config.min_barrier_width_px) {
+      barrier_snacks.push_back(snack);
     }
   }
-  if (left >= 0 && last - left + 1 >= config.min_run_width_px) runs.push_back({left, last});
-  return runs;
-}
 
-bool find_barrier_gap(const uint8_t * row, int width, const Config & config, Run & gap) {
-  const int image_center = width / 2;
-  int left_edge = -1, right_edge = -1, left = -1, last = -1;
-  auto take = [&](int run_left, int run_right) {
-    if (run_right - run_left + 1 < config.min_run_width_px) return;
-    if ((run_left + run_right) / 2 <= image_center) left_edge = std::max(left_edge, run_right);
-    else if (right_edge < 0 || run_left < right_edge) right_edge = run_left;
-  };
-  for (int x = 0; x < width; ++x) {
-    if (row[x] != 2) continue;
-    if (left < 0) left = last = x;
-    else if (x - last - 1 <= config.max_inline_gap_px) last = x;
-    else { take(left, last); left = last = x; }
+  for (const Snack & road : road_snacks) {
+    if (check_snack(
+            road, config.min_road_width_px, config.max_road_width_px)) {
+      return road;
+    }
   }
-  if (left >= 0) take(left, last);
-  if (left_edge < 0 || right_edge < 0 ||
-      right_edge - left_edge - 1 < config.min_run_width_px) return false;
-  gap = {left_edge + 1, right_edge - 1, true};
-  return true;
-}
-}  // namespace
 
-struct RoadTracker::Estimate {
-  bool valid = false;
-  int y = 0;
-  int left = -1;
-  int right = -1;
-  bool used_barrier = false;
-};
+  const Snack * left_barrier = nullptr;
+  const Snack * right_barrier = nullptr;
+
+  for (const Snack & barrier : barrier_snacks) {
+    if (barrier.end_x < reference_center &&//找到离参考点最近且不超过参考点的左挡板
+        (!left_barrier || barrier.end_x > left_barrier->end_x)) {
+      left_barrier = &barrier;
+    }
+
+    if (barrier.start_x > reference_center &&//找到离参考点最近且超过参考点的右挡板
+        (!right_barrier ||
+         barrier.start_x < right_barrier->start_x)) {
+      right_barrier = &barrier;
+    }
+  }
+
+  if (left_barrier && right_barrier) {
+    const int road_start_x = left_barrier->end_x + 1;
+    const int road_end_x = right_barrier->start_x - 1;
+    const Snack barrier_gap{
+      road_start_x,
+      road_end_x,
+      road_end_x - road_start_x + 1
+    };
+
+    if (check_snack(barrier_gap,
+                    config.min_road_width_px,
+                    config.max_road_width_px)) {
+      used_barrier_gap = true;
+      return barrier_gap;
+    }
+  }
+
+  return Snack{-1, -1, 0};
+}
+
+}  // namespace
 
 RoadTracker::RoadTracker(const Config & config) : config_(config) {}
 
-RoadTracker::Estimate RoadTracker::estimate(
-    const uint8_t * mask, int width, int height, const PreviewConfig & preview,
-    uint8_t * processed_mask) const {
-  Estimate nearest;
-  const int target_y = std::clamp(static_cast<int>(height * preview.row_ratio), 0, height - 1);
-  nearest.y = target_y;
-  const int image_center = width / 2;
-  const int seed_top = std::max(target_y, static_cast<int>(height * config_.bottom_seed_ratio));
-  Run tracked{-1, -1, false};
-  int seed_y = -1;
-  for (int y = height - 1; y >= seed_top && seed_y < 0; --y) {
-    auto runs = find_road_runs(mask + static_cast<size_t>(y) * width, width, config_);
-    if (config_.use_barrier_gap) {
-      Run gap;
-      if (find_barrier_gap(mask + static_cast<size_t>(y) * width, width, config_, gap)) runs.push_back(gap);
-    }
-    int best_score = std::numeric_limits<int>::min();
-    for (const auto & run : runs) {
-      int score = run.right - run.left + 1 - 2 * std::abs(center(run) - image_center);
-      if (run.left <= image_center && image_center <= run.right) score += width;
-      if (score > best_score) { best_score = score; tracked = run; seed_y = y; }
-    }
-  }
-  if (seed_y < 0) return nearest;
-
-  auto mark = [&](int y, const Run & run) {
-    if (!processed_mask) return;
-    const uint8_t * row = mask + static_cast<size_t>(y) * width;
-    uint8_t * output = processed_mask + static_cast<size_t>(y) * width;
-    for (int x = run.left; x <= run.right; ++x) if (row[x] == 1) output[x] = 255;
-  };
-  auto remember = [&](int y, const Run & connected) {
-    const uint8_t * row = mask + static_cast<size_t>(y) * width;
-    const auto roads = find_road_runs(row, width, config_);
-    int best = -1;
-    int best_score = std::numeric_limits<int>::min();
-    for (size_t i = 0; i < roads.size(); ++i) {
-      const int road_width = roads[i].right - roads[i].left + 1;
-      if (road_width < preview.min_width || road_width > preview.max_width) continue;
-      const int score = overlap(connected, roads[i], config_.overlap_margin_px) * 1000 -
-                        std::abs(center(roads[i]) - image_center);
-      if (score > best_score) { best_score = score; best = static_cast<int>(i); }
-    }
-    Run selected;
-    bool found = false;
-    if (best >= 0) { selected = roads[best]; found = true; }
-    else if (config_.use_barrier_gap && find_barrier_gap(row, width, config_, selected)) {
-      const int gap_width = selected.right - selected.left + 1;
-      found = gap_width >= preview.min_width && gap_width <= preview.max_width;
-    }
-    if (found) nearest = {true, y, selected.left, selected.right, selected.from_barrier};
-  };
-
-  mark(seed_y, tracked);
-  remember(seed_y, tracked);
-  int missing_rows = 0;
-  for (int y = seed_y - 1; y >= target_y; --y) {
-    auto runs = find_road_runs(mask + static_cast<size_t>(y) * width, width, config_);
-    if (config_.use_barrier_gap) {
-      Run gap;
-      if (find_barrier_gap(mask + static_cast<size_t>(y) * width, width, config_, gap)) runs.push_back(gap);
-    }
-    int best = -1, best_overlap = 0;
-    for (size_t i = 0; i < runs.size(); ++i) {
-      const int score = overlap(tracked, runs[i], config_.overlap_margin_px);
-      if (score > best_overlap) { best_overlap = score; best = static_cast<int>(i); }
-    }
-    if (best < 0) {
-      if (++missing_rows > config_.max_missing_rows) break;
-      continue;
-    }
-    missing_rows = 0;
-    tracked = runs[best];
-    mark(y, tracked);
-    remember(y, tracked);
-  }
-  return nearest;
-}
-
 Result RoadTracker::process(const uint8_t * mask, int width, int height,
+                            int reference_center,
                             uint8_t * processed_mask) const {
   Result result;
-  if (!mask || width <= 0 || height <= 0) return result;
-  const size_t mask_size = static_cast<size_t>(width) * height;
-  if (processed_mask) std::fill(processed_mask, processed_mask + mask_size, 0);
-
-  Estimate chosen = estimate(mask, width, height, config_.near, processed_mask);
-  const bool near_bad = !chosen.valid || chosen.left <= config_.near.edge_margin_px ||
-                        chosen.right >= width - 1 - config_.near.edge_margin_px;
-  const PreviewConfig * selected_config = &config_.near;
-  result.preview = Preview::NEAR;
-  if (near_bad) {
-    std::vector<uint8_t> far_mask(processed_mask ? mask_size : 0, 0);
-    const Estimate far = estimate(mask, width, height, config_.far,
-                                  far_mask.empty() ? nullptr : far_mask.data());
-    const bool far_ok = far.valid && far.left > config_.far.edge_margin_px &&
-                        far.right < width - 1 - config_.far.edge_margin_px;
-    chosen = far_ok ? far : Estimate{};
-    selected_config = &config_.far;
-    result.preview = far_ok ? Preview::FAR : Preview::NONE;
-    if (far_ok && processed_mask) std::copy(far_mask.begin(), far_mask.end(), processed_mask);
+  if (!mask || width <= 0 || height <= 0) {
+    return result;
   }
 
-  result.y = chosen.y;
-  result.selected_pt = chosen.valid ? static_cast<float>(chosen.y) / height
-                                    : selected_config->row_ratio;
-  result.min_width = selected_config->min_width;
-  result.max_width = selected_config->max_width;
-  if (!chosen.valid) return result;
-  result.valid = true;
-  result.left = chosen.left;
-  result.right = chosen.right;
-  result.width = chosen.right - chosen.left + 1;
-  result.center_x = (chosen.left + chosen.right) / 2;
-  result.deviation = result.center_x - width / 2;
-  result.used_barrier_gap = chosen.used_barrier;
+  const size_t size =
+      static_cast<size_t>(width) * static_cast<size_t>(height);
+  if (processed_mask) {
+    std::fill(processed_mask, processed_mask + size, 0);
+  }
+
+  const int scan_end_y = std::clamp(config_.scan_end_y, 0, height - 1);
+  const int search_expand_px = config_.search_expand_px;
+  const int required_valid_rows = config_.min_valid_rows;
+
+  int search_start_x = 0;
+  int search_end_x = width - 1;
+  std::vector<TrackedSnack> tracked_snacks;
+
+  for (int y = height - 1; y >= scan_end_y; --y) {
+    const uint8_t * row =
+        mask + static_cast<size_t>(y) * static_cast<size_t>(width);
+
+    bool used_barrier_gap = false;
+    const Snack best_snack =
+        find_best_snack(row, search_start_x, search_end_x, reference_center,
+                        config_, used_barrier_gap);
+
+    if (best_snack.length <= 0) {
+      tracked_snacks.clear();
+      search_start_x = 0;
+      search_end_x = width - 1;
+      continue;
+    }
+
+    tracked_snacks.push_back({best_snack, y, used_barrier_gap});
+
+    if (tracked_snacks.size() == required_valid_rows) {
+      long long deviation_sum = 0;
+      long long length_sum = 0;
+      int min_road_x=width-1;
+      int max_road_x=0;
+      bool any_used_barrier_gap = false;
+      for (const TrackedSnack & tracked : tracked_snacks) {
+        const int snack_center =
+            (tracked.snack.start_x + tracked.snack.end_x) / 2;
+        deviation_sum += snack_center - reference_center;
+        length_sum += tracked.snack.length;
+        min_road_x = std::min(min_road_x, tracked.snack.start_x);
+        max_road_x = std::max(max_road_x, tracked.snack.end_x);
+        any_used_barrier_gap =
+            any_used_barrier_gap || tracked.used_barrier_gap;
+
+        if (processed_mask) {
+          uint8_t * processed_row =
+              processed_mask +
+              static_cast<size_t>(tracked.y) * static_cast<size_t>(width);
+          std::fill(processed_row + tracked.snack.start_x,
+                    processed_row + tracked.snack.end_x + 1, 1);
+        }
+      }
+
+  
+      result.valid = true;
+      result.deviation =
+          static_cast<int>(deviation_sum / required_valid_rows);
+      result.center_x = reference_center + result.deviation;
+      result.y = tracked_snacks[tracked_snacks.size() / 2].y;
+      result.left = min_road_x;
+      result.right = max_road_x;
+      result.width = static_cast<int>(length_sum / required_valid_rows);
+      result.used_barrier_gap = any_used_barrier_gap;
+      break;
+    }
+
+    search_start_x =
+        std::max(0, best_snack.start_x - search_expand_px);
+    search_end_x =
+        std::min(width - 1, best_snack.end_x + search_expand_px);
+  }
+
   return result;
 }
 
-const char * preview_name(Preview preview) {
-  switch (preview) {
-    case Preview::NEAR: return "NEAR";
-    case Preview::FAR: return "FAR";
-    case Preview::NONE: return "NONE";
-  }
-  return "NONE";
-}
 }  // namespace road_tracking

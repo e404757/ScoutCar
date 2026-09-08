@@ -17,6 +17,13 @@ export SCOUTCAR_ENV_LOADED=1
 source /home/orangepi/ros2_humble/install/setup.bash
 source /home/orangepi/CityScout/install/local_setup.bash
 
+# 图像传输用 CycloneDDS：默认的 FastDDS 2.6 在本机回环上传 921KB 相机大帧时
+# 会出现"端点匹配但数据停滞"的间歇性断流（2026-08-30 排查 web 画面卡顿确认），
+# 旧工程单进程无 DDS 不受影响。CycloneDDS 对大消息分片传输更稳。
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+# 大分片配置：921KB 帧按 ~65KB 分片，避免默认小分片产生海量报文拖垮传输
+export CYCLONEDDS_URI=file:///home/orangepi/CityScout/config/cyclonedds.xml
+
 for _p in /home/orangepi/CityScout/install/*/; do
   export AMENT_PREFIX_PATH="$_p:$AMENT_PREFIX_PATH"
 done

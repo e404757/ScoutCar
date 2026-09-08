@@ -28,17 +28,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
 #include <deque>
-#include <filesystem>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -48,9 +42,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <sensor_msgs/msg/image.hpp>
-#include <std_msgs/msg/bool.hpp>
-#include <scoutcar_msgs/msg/mission_status.hpp>
-#include <scoutcar_msgs/msg/road_boundary.hpp>
+#include <scoutcar_msgs/msg/road_deviation.hpp>
 
 #include <opencv2/opencv.hpp>
 
@@ -60,40 +52,28 @@
 
 #include "page_html.h"
 
-namespace fs = std::filesystem;
-
 using sensor_msgs::msg::Image;
-using scoutcar_msgs::msg::RoadBoundary;
-using scoutcar_msgs::msg::MissionStatus;
+using scoutcar_msgs::msg::RoadDeviation;
+
+enum class ViewMode
+{
+  PERCEPTION,
+  IPM,
+  USB_RAW,
+  MIPI_RAW
+};
 
 class WebNode : public rclcpp::Node
 {
-public:
+public: 
   WebNode() : Node("web_node")
   {
     // ── 参数 ──
     port_ = declare_parameter<int>("port", 8080);
-    camera_topics_ = declare_parameter<std::vector<std::string>>(
-      "camera_topics", {"camera/usb/image_raw", "camera/mipi/image_raw"});
-    // 叠加画面（掩膜/边界）只来自"感知实际处理的那路相机"的 debug_image，
-    // 避免把 USB 的掩膜错套到 MIPI。网页切到其它相机时该路只显示原始画面。
-    overlay_topic_ = declare_parameter<std::string>(
-      "overlay_topic", "/camera/usb/image_raw");
-    source_topic_ = declare_parameter<std::string>(
-      "source_topic", "/perception/source_image");
-    debug_topic_ = declare_parameter<std::string>(
-      "debug_topic", "/perception/debug_image");
-    boundary_topic_ = declare_parameter<std::string>(
-      "boundary_topic", "/perception/road_boundary");
-    status_topic_ = declare_parameter<std::string>("status_topic", "/mission/status");
-    deviation_enable_topic_ = declare_parameter<std::string>(
-      "deviation_enable_topic", "/mission/deviation_enable");
     record_dir_ = declare_parameter<std::string>(
       "record_dir", "/home/orangepi/CityScout/data/record");
     // 0 表示开始录像时采用最近测得的实际感知帧率。
     record_fps_ = declare_parameter<int>("record_fps", 0);
-    record_enable_ = declare_parameter<bool>("record_enable", true);
-    bag_enable_ = declare_parameter<bool>("bag_enable", true);
     bag_dir_ = declare_parameter<std::string>(
       "bag_dir", "/home/orangepi/CityScout/data/bags");
     bag_topics_ = declare_parameter<std::vector<std::string>>(
@@ -101,56 +81,32 @@ public:
         "/perception/seg_mask",
         "/perception/road_boundary",
         "/mission/deviation_enable",
-        "/mission/status",
         "/mission/path_cmd",
         "/mcu/rx_event"
       });
     jpg_quality_ = declare_parameter<int>("jpg_quality", 85);
 
-    if (camera_topics_.empty()) {
-      camera_topics_ = {overlay_topic_};
-    }
-    // 选中相机默认指向叠加相机（感知画面）
-    selected_idx_ = 0;
-    for (size_t i = 0; i < camera_topics_.size(); ++i) {
-      if (normalizeTopic(camera_topics_[i]) == overlay_topic_) {
-        selected_idx_.store(static_cast<int>(i));
-        break;
-      }
-    }
 
-    // ── 订阅：每一路相机话题独立订阅；只有"选中"那路参与推流编码 ──
-    for (const auto & topic : camera_topics_) {
-      const std::string full = normalizeTopic(topic);
-      camera_subs_.push_back(create_subscription<Image>(
-        // best_effort + depth=1：编码期间来新帧直接替换旧帧，推流永远用最新画面。
-        full, rclcpp::QoS(1).best_effort(),
-        [this, full](const Image::SharedPtr msg) { onCamera(full, msg); }));
-      RCLCPP_INFO(get_logger(), "订阅相机话题 %s", full.c_str());
-    }
-    // 感知同帧合成的叠加画面：感知相机的推流源（掩膜/边界与图像零时间差）。
-    // best_effort + depth=1：编码慢于发布时只留最新帧，网页永远显示"现在"。
+    sub_usb_image_ = create_subscription<Image>(
+      "camera/usb/image_raw", rclcpp::QoS(1).best_effort(),
+      [this](const Image::SharedPtr msg) { onUSBCamera(msg); });
+    sub_mipi_image_ = create_subscription<Image>(
+      "camera/mipi/image_raw", rclcpp::QoS(1).best_effort(),
+      [this](const Image::SharedPtr msg) { onMIPICamera(msg); });
     sub_debug_ = create_subscription<Image>(
-      debug_topic_, rclcpp::QoS(1).best_effort(),
+      "/perception/debug_image", rclcpp::QoS(1).best_effort(),
       [this](const Image::SharedPtr msg) { onDebug(msg); });
-    // 感知输入原图：叠加录像的"原始帧"来源（与 debug_image 同帧配对）。
+    sub_ipm_debug_ = create_subscription<Image>(
+      "/perception/ipm_debug_image", rclcpp::QoS(1).best_effort(),
+      [this](const Image::SharedPtr msg) { onIpmDebug(msg); });
     sub_source_ = create_subscription<Image>(
-      source_topic_, rclcpp::QoS(5).best_effort(),
+      "/perception/source_image", rclcpp::QoS(5).best_effort(),
       [this](const Image::SharedPtr msg) { onSource(msg); });
     // 数值面板数据
-    sub_boundary_ = create_subscription<RoadBoundary>(
-      boundary_topic_, 10,
-      [this](const RoadBoundary::SharedPtr msg) { onBoundary(msg); });
-    sub_status_ = create_subscription<MissionStatus>(
-      status_topic_, 10,
-      [this](const MissionStatus::SharedPtr msg) { onStatus(msg); });
-    sub_deviation_enable_ = create_subscription<std_msgs::msg::Bool>(
-      deviation_enable_topic_, 10,
-      [this](const std_msgs::msg::Bool::SharedPtr msg) {
-        deviation_enabled_.store(msg->data);
-      });
-
-    // 录像按钮请求消费（与原工程 record_control 的主循环消费对应）
+    sub_boundary_ = create_subscription<RoadDeviation>(
+      "/perception/road_boundary", 10,
+      [this](const RoadDeviation::SharedPtr msg) { onBoundary(msg); });
+  
     control_timer_ = create_wall_timer(
       std::chrono::milliseconds(100),
       [this]() { pollRecordRequests(); });
@@ -161,7 +117,7 @@ public:
     startHttpServer(port_);
     RCLCPP_INFO(get_logger(), "web_node 就绪：http://<本机IP>:%d（录像目录 %s）",
                 port_, record_dir_.c_str());
-    RCLCPP_INFO(get_logger(), "叠加画面来源: %s", debug_topic_.c_str());
+   
   }
 
   ~WebNode() override
@@ -174,54 +130,62 @@ public:
 private:
   // ═══════════════ 话题回调 ═══════════════
 
-  static std::string normalizeTopic(const std::string & topic)
+  static const char * viewModeName(ViewMode mode)
   {
-    return (topic.empty() || topic[0] == '/') ? topic : ("/" + topic);
-  }
-
-  std::string currentTopic() const
-  {
-    if (camera_topics_.empty()) {
-      return std::string();
+    switch (mode) {
+      case ViewMode::PERCEPTION: return "perception";
+      case ViewMode::IPM: return "ipm";
+      case ViewMode::USB_RAW: return "usb_raw";
+      case ViewMode::MIPI_RAW: return "mipi_raw";
     }
-    int idx = selected_idx_.load();
-    if (idx < 0 || idx >= static_cast<int>(camera_topics_.size())) { idx = 0; }
-    return normalizeTopic(camera_topics_[idx]);
+    return "perception";
   }
 
-  // 非感知相机：直接编码原始帧推流（无叠加内容）
-  void onCamera(const std::string & topic, const Image::SharedPtr msg)
+  void onUSBCamera(const Image::SharedPtr msg)
   {
+    if(view_mode_.load() != ViewMode::USB_RAW) { return; }
+    const int width = static_cast<int>(msg->width);
+    const int height = static_cast<int>(msg->height);
+    if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
+        msg->data.size() < static_cast<size_t>(width) * height * 3)
     {
-      std::lock_guard<std::mutex> lock(cam_mutex_);
-      latest_cam_[topic] = msg;          // 记录最近一帧（共享指针，只加引用计数）
-      on_frame_time_[topic] = std::chrono::steady_clock::now();
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "图像格式异常: enc=%s %ux%u",
+                            msg->encoding.c_str(), msg->width, msg->height);
+      return;
     }
-    if (topic == currentTopic() && topic != overlay_topic_) {
-      updateFps();
-      const int width = static_cast<int>(msg->width);
-      const int height = static_cast<int>(msg->height);
-      if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
-          msg->data.size() < static_cast<size_t>(width) * height * 3)
-      {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "图像格式异常: enc=%s %ux%u",
-                             msg->encoding.c_str(), msg->width, msg->height);
-        return;
-      }
-      // rgb8 → BGR 后 JPEG 编码（推流色彩正确）
-      cv::Mat rgb_view(height, width, CV_8UC3,
-                       const_cast<uint8_t *>(msg->data.data()));
-      cv::Mat bgr;
-      cv::cvtColor(rgb_view, bgr, cv::COLOR_RGB2BGR);
-      encodeLive(bgr);
-    }
+    // rgb8 → BGR 后 JPEG 编码（推流色彩正确）
+    cv::Mat rgb_view(height, width, CV_8UC3,
+                      const_cast<uint8_t *>(msg->data.data()));
+    cv::Mat bgr;
+    cv::cvtColor(rgb_view, bgr, cv::COLOR_RGB2BGR);
+    encodeLive(bgr);
+    
   }
-
-  // 感知相机：直接显示感知同帧合成好的叠加画面（掩膜/边界与图像零时间差）
+  void onMIPICamera(const Image::SharedPtr msg)
+  {
+    if(view_mode_.load() != ViewMode::MIPI_RAW) { return; }
+    const int width = static_cast<int>(msg->width);
+    const int height = static_cast<int>(msg->height);
+    if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
+        msg->data.size() < static_cast<size_t>(width) * height * 3)
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "图像格式异常: enc=%s %ux%u",
+                            msg->encoding.c_str(), msg->width, msg->height);
+      return;
+    }
+    // rgb8 → BGR 后 JPEG 编码（推流色彩正确）
+    cv::Mat rgb_view(height, width, CV_8UC3,
+                      const_cast<uint8_t *>(msg->data.data()));
+    cv::Mat bgr;
+    cv::cvtColor(rgb_view, bgr, cv::COLOR_RGB2BGR);
+    encodeLive(bgr);
+    
+  }
   void onDebug(const Image::SharedPtr msg)
   {
-    have_debug_stream_.store(true);
+    
     updateRecordInputFps();
     const int width = static_cast<int>(msg->width), height = static_cast<int>(msg->height);
     if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
@@ -238,12 +202,24 @@ private:
         recorder_.write_frame(source->data.data(), msg->data.data(), width, height);
       }
     }
-    if (currentTopic() != overlay_topic_) { return; }
-    updateFps();
+    if(view_mode_.load() != ViewMode::PERCEPTION) { return;}
     cv::Mat rgb(height, width, CV_8UC3, const_cast<uint8_t *>(msg->data.data()));
     cv::Mat bgr;
     cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
     encodeLive(bgr);
+    
+  }
+  void onIpmDebug(const Image::SharedPtr msg)
+  {
+    if(view_mode_.load() != ViewMode::IPM){return;}
+    const int width = static_cast<int>(msg->width), height = static_cast<int>(msg->height);
+    if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
+        msg->data.size() < static_cast<size_t>(width) * height * 3) return;
+    cv::Mat rgb(height, width, CV_8UC3, const_cast<uint8_t *>(msg->data.data()));
+    cv::Mat bgr;
+    cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+    encodeLive(bgr);
+    
   }
 
   // 推流帧编码（JPEG，主线程编码后加锁换入缓冲，帧序号供推流线程检测更新）
@@ -274,18 +250,11 @@ private:
     return nullptr;
   }
 
-  void onBoundary(const RoadBoundary::SharedPtr msg)
+  void onBoundary(const RoadDeviation::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(boundary_mutex_);
     latest_boundary_ = *msg;
     boundary_time_ = std::chrono::steady_clock::now();
-  }
-
-  void onStatus(const MissionStatus::SharedPtr msg)
-  {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-    latest_status_ = *msg;
-    status_time_ = std::chrono::steady_clock::now();
   }
 
   // ═══════════════ 录像控制 ═══════════════
@@ -294,14 +263,10 @@ private:
   {
     const int req = record_request_.exchange(0);
     if (req == 1) {
-      if (!record_enable_) {
-        RCLCPP_WARN(get_logger(), "收到录像请求但 record_enable=false");
-        return;
-      }
       const int measured_fps = static_cast<int>(std::lround(record_input_fps_.load()));
       const int output_fps = record_fps_ > 0 ? record_fps_ : std::clamp(measured_fps, 1, 60);
       const int safe_fps = output_fps > 0 ? output_fps : 20;
-      if (recorder_.start(safe_fps) && bag_enable_) {
+      if (recorder_.start(safe_fps) ) {
         if (!bag_recorder_.start(recorder_.current_base())) {
           RCLCPP_ERROR(get_logger(), "视频已开始，但 rosbag 启动失败");
         }
@@ -312,21 +277,7 @@ private:
     }
   }
 
-  // ═══════════════ FPS 统计 ═══════════════
-
-  void updateFps()
-  {
-    fps_count_++;
-    const auto now = std::chrono::steady_clock::now();
-    const double elapsed =
-      std::chrono::duration<double>(now - fps_last_).count();
-    if (elapsed >= 2.0) {
-      current_fps_.store(fps_count_ / elapsed);
-      fps_count_ = 0;
-      fps_last_ = now;
-    }
-  }
-
+  // ═══════════════ 录像输入帧率统计 ═══════════════
   void updateRecordInputFps()
   {
     record_fps_count_++;
@@ -375,21 +326,9 @@ private:
       res.set_content(kPageHtml, "text/html; charset=utf-8");
     });
 
-    // 实时 MJPEG 推流（?cam=话题 → 推那一路；缺省推感知叠加画面）
-    svr_->Get("/video_feed", [this](const httplib::Request & req,
+    // 实时 MJPEG 推流；具体画面由 view_mode_ 选择
+    svr_->Get("/video_feed", [this](const httplib::Request &,
                                     httplib::Response & res) {
-      const std::string topic = normalizeTopic(req.get_param_value("cam"));
-      const std::string wanted =
-        topic.empty() || topic == "/" ? overlay_topic_ : topic;
-      bool known = false;
-      for (const auto & t : camera_topics_) {
-        if (normalizeTopic(t) == wanted) { known = true; break; }
-      }
-      if (!known) {
-        res.status = 404;
-        res.set_content("unknown camera", "text/plain");
-        return;
-      }
       res.set_content_provider(
         static_cast<size_t>(-1),
         "multipart/x-mixed-replace; boundary=frame",
@@ -427,48 +366,34 @@ private:
         });
     });
 
-    // 状态（页面轮询：录像状态 + 相机信号 + 任务状态 + 道路边界数值）
+    // 状态（页面轮询：录像状态、当前视图、道路跟踪参数）
     svr_->Get("/api/status", [this](const httplib::Request &, httplib::Response & res) {
       res.set_content(statusJson(), "application/json");
     });
 
-    // 相机列表 + 当前选中
-    svr_->Get("/api/cameras", [this](const httplib::Request &, httplib::Response & res) {
-      char buf[256];
-      snprintf(buf, sizeof(buf), "{\"ok\":true,\"selected\":\"%s\",\"cameras\":%s}",
-               currentTopic().c_str(), camerasJson().c_str());
-      res.set_content(buf, "application/json");
-    });
-
-    // 切换推流相机（网页端下拉/按钮）：?topic=/camera/mipi/image_raw
-    svr_->Post("/api/camera/set", [this](const httplib::Request & req, httplib::Response & res) {
-      std::string t = normalizeTopic(req.get_param_value("topic"));
-      bool found = false;
-      for (size_t i = 0; i < camera_topics_.size(); ++i) {
-        if (normalizeTopic(camera_topics_[i]) == t) {
-          selected_idx_.store(static_cast<int>(i)); found = true; break;
-        }
-      }
-      if (!found) {
-        res.set_content("{\"ok\":false,\"reason\":\"unknown topic\"}", "application/json");
+    svr_->Post("/api/view/set", [this](const httplib::Request & req, httplib::Response & res) {
+      const std::string mode = req.get_param_value("mode");
+      ViewMode next;
+      if (mode == "perception") next = ViewMode::PERCEPTION;
+      else if (mode == "ipm") next = ViewMode::IPM;
+      else if (mode == "usb_raw") next = ViewMode::USB_RAW;
+      else if (mode == "mipi_raw") next = ViewMode::MIPI_RAW;
+      else {
+        res.status = 400;
+        res.set_content("{\"ok\":false,\"reason\":\"unknown mode\"}", "application/json");
         return;
       }
-      // 切换后清空推流缓冲，避免新相机第一帧前残留旧相机画面
+      view_mode_.store(next);
       {
         std::lock_guard<std::mutex> lock(live_mutex_);
         live_jpeg_.clear();
       }
-      RCLCPP_INFO(get_logger(), "切换推流相机 → %s", t.c_str());
+      RCLCPP_INFO(get_logger(), "切换网页画面 → %s", viewModeName(next));
       res.set_content(statusJson(), "application/json");
     });
 
     // 录像起停（网页按钮）
     svr_->Post("/api/record/start", [this](const httplib::Request &, httplib::Response & res) {
-      if (!record_enable_) {
-        res.set_content("{\"ok\":false,\"reason\":\"record_enable=false\"}",
-                        "application/json");
-        return;
-      }
       record_request_.store(1);
       res.set_content(statusJson(), "application/json");
     });
@@ -490,27 +415,7 @@ private:
                std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count());
     };
 
-    // 任务状态数值面板（对应原 FF 01 调试帧的信息）
-    std::string mission_json;
-    {
-      std::lock_guard<std::mutex> lock(status_mutex_);
-      const long long ms = ageMs(status_time_);
-      const bool online = ms >= 0 && ms <= 1500;
-      const int state = latest_status_ ? latest_status_->state : -1;
-      char buf[256];
-      snprintf(buf, sizeof(buf),
-               "{\"online\":%s,\"driving_state\":\"%s\",\"state\":%d,\"current_node\":%d,\"seg_index\":%d,"
-               "\"fixed_remain\":%d,\"random_remain\":%d}",
-               online ? "true" : "false",
-               deviation_enabled_.load() ? "NORMAL" : "TURNING", state,
-               latest_status_ ? latest_status_->current_node : -1,
-               latest_status_ ? latest_status_->seg_index : -1,
-               latest_status_ ? latest_status_->fixed_remain : -1,
-               latest_status_ ? latest_status_->random_remain : -1);
-      mission_json = buf;
-    }
-
-    // 道路边界数值面板
+    // 道路跟踪参数面板：仅暴露当前算法采用的阈值和扫描行。
     std::string boundary_json;
     {
       std::lock_guard<std::mutex> lock(boundary_mutex_);
@@ -518,134 +423,60 @@ private:
       const bool online = ms >= 0 && ms <= 1500;
       char buf[1024];
       snprintf(buf, sizeof(buf),
-               "{\"online\":%s,\"valid\":%s,\"deviation\":%d,\"preview_mode\":\"%s\","
-               "\"selected_pt\":%.3f,\"scan_y\":%u,\"road_center\":%u,"
-               "\"left\":%d,\"right\":%d,\"width\":%u,"
-               "\"min_width\":%u,\"max_width\":%u,"
-               "\"width_status\":\"%s\","
-               "\"boundary_source\":\"%s\",\"algorithm_valid\":%s,"
-               "\"algorithm_deviation\":%d,\"control_ready\":%s}",
+               "{\"online\":%s,\"scan_y\":%u,"
+               "\"min_width\":%u,\"max_width\":%u}",
                online ? "true" : "false",
-               latest_boundary_ ? (latest_boundary_->valid ? "true" : "false") : "false",
-               latest_boundary_ ? latest_boundary_->deviation : 0,
-               latest_boundary_ ? latest_boundary_->preview_mode.c_str() : "",
-               latest_boundary_ ? latest_boundary_->selected_pt : 0.0f,
                latest_boundary_ ? latest_boundary_->scan_y : 0,
-               latest_boundary_ ? latest_boundary_->road_center : 0,
-               latest_boundary_ ? latest_boundary_->left : -1,
-               latest_boundary_ ? latest_boundary_->right : -1,
-               latest_boundary_ ? latest_boundary_->width : 0,
                latest_boundary_ ? latest_boundary_->min_width : 0,
-               latest_boundary_ ? latest_boundary_->max_width : 0,
-               latest_boundary_ ? latest_boundary_->width_status.c_str() : "",
-               latest_boundary_ ? latest_boundary_->boundary_source.c_str() : "",
-               latest_boundary_ ? (latest_boundary_->algorithm_valid ? "true" : "false") : "false",
-               latest_boundary_ ? latest_boundary_->algorithm_deviation : -999,
-               latest_boundary_ ? (latest_boundary_->control_ready ? "true" : "false") : "false");
+               latest_boundary_ ? latest_boundary_->max_width : 0);
       boundary_json = buf;
     }
 
     char buf[1024];
     snprintf(buf, sizeof(buf),
-             "{\"ok\":true,\"record_enable\":%s,\"recording\":%s,"
-             "\"bag_enable\":%s,\"bag_recording\":%s,"
-             "\"record_dir\":\"%s\",\"fps\":%.1f,\"cameras\":%s,"
-             "\"mission\":%s,\"boundary\":%s}",
-             record_enable_ ? "true" : "false",
+             "{\"ok\":true,\"recording\":%s,\"bag_recording\":%s,"
+             "\"view_mode\":\"%s\","
+             "\"boundary\":%s}",
              recorder_.active() ? "true" : "false",
-             bag_enable_ ? "true" : "false",
              bag_recorder_.active() ? "true" : "false",
-             record_dir_.c_str(),
-             current_fps_.load(), camerasJson().c_str(),
-             mission_json.c_str(), boundary_json.c_str());
+             viewModeName(view_mode_.load()),
+             boundary_json.c_str());
     return std::string(buf);
-  }
-
-  // 相机列表 + 当前选中 + 是否有信号（最近 1.5s 内收过帧）
-  std::string camerasJson()
-  {
-    std::string sel = currentTopic();
-    std::string json = "[";
-    auto now = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < camera_topics_.size(); ++i) {
-      const std::string t = normalizeTopic(camera_topics_[i]);
-      if (i > 0) { json += ","; }
-      bool has = false;
-      {
-        std::lock_guard<std::mutex> lock(cam_mutex_);
-        auto it = latest_cam_.find(t);
-        if (it != latest_cam_.end() && it->second != nullptr) {
-          const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - on_frame_time_[t]).count();
-          has = (age >= 0 && age <= 1500) && it->second->header.stamp.sec > 0;
-        }
-      }
-      char buf[256];
-      snprintf(buf, sizeof(buf),
-               "{\"topic\":\"%s\",\"selected\":%s,\"overlay\":%s,\"has_frame\":%s}",
-               t.c_str(), (t == sel) ? "true" : "false",
-               (t == overlay_topic_) ? "true" : "false",
-               has ? "true" : "false");
-      json += buf;
-    }
-    json += "]";
-    return json;
   }
 
   // ═══════════════ 成员 ═══════════════
 
   // 参数
   int port_ = 8080;
-  std::vector<std::string> camera_topics_;
-  std::string overlay_topic_;
-  std::string source_topic_;
-  std::string debug_topic_;
-  std::string boundary_topic_;
-  std::string status_topic_;
-  std::string deviation_enable_topic_;
   std::string record_dir_;
   int record_fps_ = 0;
-  bool record_enable_ = true;
-  bool bag_enable_ = true;
   std::string bag_dir_;
   std::vector<std::string> bag_topics_;
   int jpg_quality_ = 85;
 
   // 话题
-  std::vector<rclcpp::Subscription<Image>::SharedPtr> camera_subs_;
-  std::atomic<int> selected_idx_{0};
-  std::mutex cam_mutex_;
-  std::map<std::string, Image::SharedPtr> latest_cam_;
-  std::map<std::string, std::chrono::steady_clock::time_point> on_frame_time_;
+  std::atomic<ViewMode> view_mode_{ViewMode::PERCEPTION};
+  rclcpp::Subscription<Image>::SharedPtr sub_usb_image_;
+  rclcpp::Subscription<Image>::SharedPtr sub_mipi_image_;
   rclcpp::Subscription<Image>::SharedPtr sub_source_;
   rclcpp::Subscription<Image>::SharedPtr sub_debug_;
-  rclcpp::Subscription<RoadBoundary>::SharedPtr sub_boundary_;
-  rclcpp::Subscription<MissionStatus>::SharedPtr sub_status_;
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_deviation_enable_;
+  rclcpp::Subscription<Image>::SharedPtr sub_ipm_debug_;
+  rclcpp::Subscription<RoadDeviation>::SharedPtr sub_boundary_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 
   // 叠加录像的原始帧配对队列（source_image 按时间戳精确匹配 debug_image）
   std::mutex source_mutex_;
   std::deque<std::pair<builtin_interfaces::msg::Time, Image::SharedPtr>> source_queue_;
 
-  // 数值面板数据（图像上不绘制文字，全部走这里）
+  // 参数面板数据
   std::mutex boundary_mutex_;
-  std::optional<RoadBoundary> latest_boundary_;
+  std::optional<RoadDeviation> latest_boundary_;
   std::chrono::steady_clock::time_point boundary_time_{};
-  std::atomic<bool> have_debug_stream_{false};
-  std::mutex status_mutex_;
-  std::optional<MissionStatus> latest_status_;
-  std::chrono::steady_clock::time_point status_time_{};
-  // Web 未收到转向指令时默认显示正常；任务离线不再产生第三种状态。
-  std::atomic<bool> deviation_enabled_{true};
 
   // 推流
   std::mutex live_mutex_;
   std::vector<uint8_t> live_jpeg_;
   std::atomic<uint64_t> frame_seq_{0};   // 每编码一帧 +1，推流线程据此跳过未更新帧
-  std::atomic<int> fps_count_{0};
-  std::chrono::steady_clock::time_point fps_last_{std::chrono::steady_clock::now()};
-  std::atomic<double> current_fps_{0.0};
   int record_fps_count_ = 0;
   std::chrono::steady_clock::time_point record_fps_last_{std::chrono::steady_clock::now()};
   std::atomic<double> record_input_fps_{20.0};

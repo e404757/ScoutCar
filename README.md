@@ -39,7 +39,9 @@ ros2 launch scoutcar_bringup cameras.launch.py
 启动完整链路：
 
 ```bash
+systemctl stop cityscout-cameras.service
 ros2 launch scoutcar_bringup cityscout.launch.py
+ros2 launch scoutcar_web web.launch.py 
 ```
 
 

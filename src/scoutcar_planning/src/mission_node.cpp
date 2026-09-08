@@ -1,17 +1,3 @@
-// mission_node —— 任务节点（巡逻任务状态机）
-//
-// 对应原工程 main.cc 的任务状态机部分：
-//   全局原子变量 + while(1) 轮询  →  节点私有成员 + 事件回调（事件驱动，无轮询）
-//
-// 输入：
-//   /mcu/rx_event        下位机事件（START=复位开跑 / ARRIVED=到达并开始转向 /
-//                                      TURN_FINISHED=转向结束 / OBSTACLE=障碍重规划）
-//   /mission/recon_found 侦查点发现（v1 人工/调试发布；v3 detection 接入）
-// 输出：
-//   /mission/path_cmd           路径段指令 → serial_node（打包 FF 02 发下位机）
-//   /mission/status             任务状态 → serial_node（发调试帧 FF 01）/ web / telemetry
-//   /mission/deviation_enable   偏差帧开关 → serial_node（掉头/重规划期间关闭）
-
 #include <algorithm>
 #include <cstdint>
 #include <set>
@@ -39,7 +25,7 @@ namespace {
 const std::vector<int> kFixedPoints = {2, 4, 5, 8, 9, 12, 13, 16, 17, 18, 19, 20};
 const std::set<int> kFixedSet(kFixedPoints.begin(), kFixedPoints.end());
 const std::vector<mission::Edge> kTunnels = {{6, 7}, {10, 11}, {14, 15}, {18, 19}};
-
+const int recon_target = 8;  
 }  // namespace
 
 class MissionNode : public rclcpp::Node
@@ -50,11 +36,10 @@ public:
     graph_(buildDefaultMap()),
     planner_(graph_, cfg_)
   {
-    // ── 参数（对应 config/cityscout.yaml 的 planning 节）──
+    //规划器参数
     cfg_.turn_penalty = declare_parameter<double>("turn_penalty", 0.5);
     cfg_.u_turn_penalty = declare_parameter<double>("u_turn_penalty", 1.0);
     cfg_.tunnel_risk = declare_parameter<double>("tunnel_risk", 0.0);
-    cfg_.recon_target = declare_parameter<int>("recon_target", 8);
     cfg_.home = 1;
     const std::string obstacle_mode = declare_parameter<std::string>(
       "obstacle_mode", "bidirectional");
@@ -63,15 +48,14 @@ public:
                   obstacle_mode.c_str());
     }
     planner_.setConfig(cfg_);
-    random_remain_ = cfg_.recon_target;
+  
 
-    // ── 接口 ──
     pub_path_ = create_publisher<scoutcar_msgs::msg::PathCmd>("mission/path_cmd", 10);
     const auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
-    pub_status_ = create_publisher<scoutcar_msgs::msg::MissionStatus>(
-      "mission/status", status_qos);
+    pub_car_status_ = create_publisher<scoutcar_msgs::msg::MissionStatus>(
+      "mission/car_status", status_qos);
+    pub_cam_status_ = create_publisher<std_msgs::msg::Bool>("mission/cam_status",status_qos);
     pub_dev_ = create_publisher<std_msgs::msg::Bool>("mission/deviation_enable", 10);
-
     sub_event_ = create_subscription<scoutcar_msgs::msg::RxEvent>(
       "mcu/rx_event", 10,
       [this](const scoutcar_msgs::msg::RxEvent::SharedPtr msg) { on_event(msg->event); });
@@ -83,13 +67,11 @@ public:
           on_recon_found();
         }
       });
-
-    // 上电：发一次就绪状态（serial_node 收到后发调试帧，同原 send_count_update）
     publish_status();
   }
 
 private:
-  // ═══════════════ 事件入口 ═══════════════
+  
 
   void on_event(uint8_t event)
   {
@@ -97,21 +79,25 @@ private:
       case scoutcar_msgs::msg::RxEvent::START:
         do_restart();
         break;
+      case scoutcar_msgs::msg::RxEvent::CAM_AHEAD:
+        cam_msg.data = false;
+        pub_cam_status_->publish(cam_msg);//表示未转
+        break;
+      case scoutcar_msgs::msg::RxEvent::CAM_TURNED:
+        cam_msg.data = true;
+        pub_cam_status_->publish(cam_msg);//表示转了
+        break;
       case scoutcar_msgs::msg::RxEvent::ARRIVED:
         on_arrived();
         break;
       case scoutcar_msgs::msg::RxEvent::TURN_FINISHED:
         on_turn_finished();
         break;
-      case scoutcar_msgs::msg::RxEvent::OBSTACLE:
-        do_obstacle();
-        break;
       default:
         break;
     }
   }
 
-  // 0xAA：复位 + 重规划 + 开跑（原 restart_requested 分支 + replan_mission）
   void do_restart()
   {
     set_deviation(false);
@@ -120,13 +106,13 @@ private:
       return;
     }
     fixed_remain_ = static_cast<int>(kFixedPoints.size());
-    random_remain_ = cfg_.recon_target;
-    uturn_pending_ = false;
-    awaiting_turn_finished_ = false;
+    random_remain_ = recon_target;
+    waiting_uturn_finished_ = false;
+    waiting_turn_finished_ = false;
     mission_started_ = true;
     mission_done_ = false;
     publish_status();
-    // 原主循环"下一轮"即发第一段：事件驱动下直接发
+  
     send_segment(0);
     pending_from_ = segments_[0].node;
     pending_arrival_ = segments_[0].next;
@@ -145,19 +131,13 @@ private:
     if (!mission_started_ || mission_done_) {
       return;
     }
-    if (awaiting_turn_finished_) {
-      RCLCPP_DEBUG(get_logger(), "转向尚未完成，忽略重复的到达通知");
-      return;
-    }
-    awaiting_turn_finished_ = true;
     const TurnAction acting = seg_index_ < segments_.size()
       ? segments_[seg_index_].action : TurnAction::STOP;
-    if (acting == TurnAction::LEFT || acting == TurnAction::RIGHT ||
-        acting == TurnAction::UTURN)
+    if (acting == TurnAction::LEFT || acting == TurnAction::RIGHT || acting == TurnAction::UTURN)
     {
       set_deviation(false);
     }
-    if (uturn_pending_) {
+    if (waiting_uturn_finished_) {
       RCLCPP_DEBUG(get_logger(), "掉头尚未完成，忽略到达通知");
       return;
     }
@@ -182,7 +162,7 @@ private:
       // 侦查点钩子：v1 由 /mission/recon_found 订阅触发（原 on_edge_traversed 写死 false）
     }
     // 侦查点找齐：收尾重规划（原收尾分支）
-    if (recon_found_ >= cfg_.recon_target && !recon_finished_) {
+    if (recon_found_ >= recon_target && !recon_finished_) {
       recon_finished_ = true;
       if (replan_from_current() == 0) {
         RCLCPP_INFO(get_logger(), "侦查点找齐，收尾重规划");
@@ -217,11 +197,11 @@ private:
     if (!mission_started_) {
       return;
     }
-    awaiting_turn_finished_ = false;
+    waiting_turn_finished_ = false;
     if (mission_done_) {
       return;
     }
-    if (uturn_pending_) {
+    if (waiting_uturn_finished_) {
       if (segments_.empty()) {
         RCLCPP_WARN(get_logger(), "掉头结束，但重规划路径为空");
         return;
@@ -230,7 +210,7 @@ private:
       pending_from_ = segments_[0].node;
       pending_arrival_ = segments_[0].next;
       first_segment_sent_ = true;
-      uturn_pending_ = false;
+      waiting_uturn_finished_= false;
       seg_index_ = 1;
     }
     set_deviation(true);
@@ -255,8 +235,8 @@ private:
     ut.goal = static_cast<uint8_t>(current_node_);
     ut.action = scoutcar_msgs::msg::PathCmd::UTURN;
     pub_path_->publish(ut);
-    uturn_pending_ = true;
-    awaiting_turn_finished_ = true;
+    waiting_uturn_finished_= true;
+    waiting_turn_finished_ = true;
     mission_started_ = true;
     mission_done_ = false;
     first_segment_sent_ = false;
@@ -361,7 +341,7 @@ private:
     st.current_node = current_node_;
     st.seg_index = static_cast<int32_t>(seg_index_);
     st.state = mission_done_ ? 2 : (mission_started_ ? 1 : 0);
-    pub_status_->publish(st);
+    pub_car_status_->publish(st);
   }
 
   void on_fixed_reached(int node)
@@ -388,21 +368,25 @@ private:
                 fixed_remain_, random_remain_, recon_found_, cfg_.recon_target);
   }
 
-  // ═══════════════ 状态（原 main.cc 全局变量 → 节点私有成员） ═══════════════
+  
   bool mission_started_ = false;
   bool mission_done_ = false;
   bool first_segment_sent_ = false;
-  bool uturn_pending_ = false;
-  bool awaiting_turn_finished_ = false;
+  bool waiting_uturn_finished_ = false;
+  bool waiting_turn_finished_ = false;
+
   std::vector<StepCommand> segments_;
   size_t seg_index_ = 1;
   int current_node_ = 1;
   int pending_from_ = -1;
   int pending_arrival_ = -1;
-  int fixed_remain_ = static_cast<int>(kFixedPoints.size());
-  int random_remain_ = 0;   // 构造时按 cfg_.recon_target 初始化
-  int recon_found_ = 0;
-  bool recon_finished_ = false;
+
+  int fixed_remain_ = static_cast<int>(kFixedPoints.size());//固定点剩余数量
+  int random_remain_ = recon_target;//侦察点剩余数量
+  int recon_found_ = 0;//已发现侦察点数量
+  bool recon_finished_ = false;//侦察任务是否完成
+  std_msgs::msg::Bool cam_msg;
+
   std::set<int> fixed_done_;
   std::set<mission::Edge> searched_edges_;
   std::set<mission::Edge> tunnel_done_;
@@ -414,10 +398,13 @@ private:
   mission::MissionPlanner planner_;
 
   rclcpp::Publisher<scoutcar_msgs::msg::PathCmd>::SharedPtr pub_path_;
-  rclcpp::Publisher<scoutcar_msgs::msg::MissionStatus>::SharedPtr pub_status_;
+  rclcpp::Publisher<scoutcar_msgs::msg::MissionStatus>::SharedPtr pub_car_status_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_dev_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_cam_status_;
+
   rclcpp::Subscription<scoutcar_msgs::msg::RxEvent>::SharedPtr sub_event_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_recon_;
+
 };
 
 int main(int argc, char ** argv)

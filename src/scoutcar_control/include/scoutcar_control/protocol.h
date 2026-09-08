@@ -37,13 +37,11 @@ enum class Status : uint8_t {
 
 // 下位机回传 flag（接收帧 `FF 01 00 [flag] 00 DD` 的 flag 字节）
 enum class RxFlag : uint8_t {
-    PT_80    = 0x11,  // 预瞄行设为图像高度的 0.8
     START    = 0xAA,  // 启动小车，可发第一段路径
+    CAM_AHEAD = 0xBB,  // 摄像头朝前
+    CAM_TURNED = 0xCC,  // 摄像头转向两侧
     ARRIVED  = 0xDD,  // 小车到达目标点，开始转向
     TURN_FINISHED = 0xEE,  // 小车转向结束，恢复循迹
-    OBSTACLE = 0xCC,  // 障碍：立即从当前位置重规划 + 发一个掉头帧
-    PT_40    = 0x22,  // 预瞄行设为图像高度的 0.4
-    STRAIGHT = 0xFF,  // 直行心跳：直行状态下持续发送（路口直行 = DD 后紧跟 EE 再回 FF 流）
 };
 
 // 转向动作（路径段帧的 action 字节）

@@ -5,12 +5,13 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(OpenCV REQUIRED)
+#查找已经安装好的库
+find_package(ament_cmake REQUIRED)#ros2的cmake包
+find_package(rclcpp REQUIRED)#ros2的c++节点库
+find_package(sensor_msgs REQUIRED)#ros2的传感器消息库
+find_package(OpenCV REQUIRED)#opencv库
 
-# 摄像头驱动节点：vendor/camera.cc 原样搬（OpenCV VideoCapture 封装）
+# 摄像头驱动节点
 add_executable(camera_node
   src/camera_node.cpp
   vendor/camera.cc

@@ -189,13 +189,11 @@ static void rx_loop()
                         else reset_with_byte(byte);
                         break;
                     case READ_FLAG:
-                        if (byte == (int)pathplan::RxFlag::PT_80 ||
-                            byte == (int)pathplan::RxFlag::START ||
+                        if (byte == (int)pathplan::RxFlag::START ||
                             byte == (int)pathplan::RxFlag::ARRIVED ||
                             byte == (int)pathplan::RxFlag::TURN_FINISHED ||
-                            byte == (int)pathplan::RxFlag::OBSTACLE ||
-                            byte == (int)pathplan::RxFlag::PT_40 ||
-                            byte == (int)pathplan::RxFlag::STRAIGHT) {
+                            byte == (int)pathplan::RxFlag::CAM_AHEAD ||
+                            byte == (int)pathplan::RxFlag::CAM_TURNED ) {
                             pending_flag = static_cast<pathplan::RxFlag>(byte);
                             state = WAIT_00_2;
                         } else {

@@ -92,6 +92,8 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
+  //make_shared<CameraNode>() 会实例化一个 CameraNode 对象，并返回指向该对象的共享智能指针
+  //随后将该指针传给 spin()，使 ROS 2 持续运行这个节点并处理它的回调和事件。
   rclcpp::spin(std::make_shared<CameraNode>());
   rclcpp::shutdown();
   return 0;
