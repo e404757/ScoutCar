@@ -17,5 +17,7 @@ web_node:
       - /perception/road_boundary
       - /mission/deviation_enable
       - /mission/path_cmd
+      - /mission/detect_task
       - /mcu/rx_event
+      - /obstacle/event
     jpg_quality: 85

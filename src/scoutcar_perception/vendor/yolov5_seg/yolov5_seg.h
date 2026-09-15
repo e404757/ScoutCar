@@ -30,19 +30,19 @@ typedef struct {
     int input_image_width;
     int input_image_height;
     bool is_quant;
-} rknn_app_context_t;
+} seg_rknn_app_context_t;
 
 #include "postprocess.h"
 
 
-int init_yolov5_seg_model(const char* model_path, rknn_app_context_t* app_ctx);
+int init_yolov5_seg_model(const char* model_path, seg_rknn_app_context_t* app_ctx);
 
-int release_yolov5_seg_model(rknn_app_context_t* app_ctx);
+int release_yolov5_seg_model(seg_rknn_app_context_t* app_ctx);
 
-int inference_yolov5_seg_model(rknn_app_context_t* app_ctx, image_buffer_t* img, object_detect_result_list* od_results);
+int inference_yolov5_seg_model(seg_rknn_app_context_t* app_ctx, image_buffer_t* img, seg_object_detect_result_list* od_results);
 
 // CPU 预处理的推理入口：与 inference_yolov5_seg_model 相同，仅预处理用 CPU(crop+stretch)，不经过 RGA。
 // 供输入为 malloc 普通内存(如内存视频帧)的场景使用，避免 RGA importbuffer_virtualaddr 崩溃。
-int inference_yolov5_seg_model_cpu(rknn_app_context_t* app_ctx, image_buffer_t* img, object_detect_result_list* od_results);
+int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t* app_ctx, image_buffer_t* img, seg_object_detect_result_list* od_results);
 
 #endif //_RKNN_DEMO_YOLOV5_SEG_H_

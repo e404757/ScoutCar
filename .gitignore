@@ -1,25 +1,18 @@
-# ROS 2 / colcon generated output
+# 构建产物
 build/
 install/
 log/
 
-# Other large runtime assets (the production V1.0.rknn is versioned explicitly)
-*.onnx
-*.engine
-assets/models/
-
-# Captures, recordings and bags
-captures/
-recordings/
-data/bags/
-data/record/
+# 本地数据
+data/
 *.bag
 *.db3
 *.mcap
 *.zstd
 *.avi
+*.jpg
 
-# Editor, temporary and backup files
+# 编辑器和临时文件
 .vscode/
 __pycache__/
 *.py[cod]
@@ -28,7 +21,7 @@ __pycache__/
 *.orig
 *~
 
-# Secrets and local machine configuration
+# 本机配置和密钥
 .env
 .env.*
 *.pem

@@ -17,7 +17,7 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
            get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
 }
 
-int init_yolov5_seg_model(const char *model_path, rknn_app_context_t *app_ctx)
+int init_yolov5_seg_model(const char *model_path, seg_rknn_app_context_t *app_ctx)
 {
 
     int ret;
@@ -126,7 +126,7 @@ int init_yolov5_seg_model(const char *model_path, rknn_app_context_t *app_ctx)
     return 0;
 }
 
-int release_yolov5_seg_model(rknn_app_context_t *app_ctx)
+int release_yolov5_seg_model(seg_rknn_app_context_t *app_ctx)
 {
     if (app_ctx->input_attrs != NULL)
     {
@@ -171,7 +171,7 @@ static void convert_image_cpu_crop_stretch(const uint8_t* src, int src_w, int sr
     }
 }
 
-int inference_yolov5_seg_model(rknn_app_context_t *app_ctx, image_buffer_t *img, object_detect_result_list *od_results)
+int inference_yolov5_seg_model(seg_rknn_app_context_t *app_ctx, image_buffer_t *img, seg_object_detect_result_list *od_results)
 {
     int ret;
     image_buffer_t dst_img;
@@ -281,7 +281,7 @@ int inference_yolov5_seg_model(rknn_app_context_t *app_ctx, image_buffer_t *img,
     }
 
     // Post Process
-    post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
+    seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
 
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
@@ -297,7 +297,7 @@ out:
 // CPU 预处理的推理入口: 与 inference_yolov5_seg_model 唯一区别是预处理用 CPU
 // (crop+stretch), 不经过 RGA。供输入为 malloc 普通内存(如内存视频帧)的场景使用,
 // 避免 RGA importbuffer_virtualaddr 对非 RGA 兼容内存崩溃。模型与后处理完全复用。
-int inference_yolov5_seg_model_cpu(rknn_app_context_t *app_ctx, image_buffer_t *img, object_detect_result_list *od_results)
+int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer_t *img, seg_object_detect_result_list *od_results)
 {
     int ret;
     image_buffer_t dst_img;
@@ -402,7 +402,7 @@ int inference_yolov5_seg_model_cpu(rknn_app_context_t *app_ctx, image_buffer_t *
     }
 
     // Post Process
-    post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
+    seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
 
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 

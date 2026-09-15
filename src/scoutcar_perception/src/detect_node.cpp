@@ -24,18 +24,18 @@ class DetectNode : public rclcpp::Node
                 ament_index_cpp::get_package_share_directory(
                     "scoutcar_perception");
             model_path_ = declare_parameter<std::string>("model_path", package_share + "/home/orangepi/CityScout/src/scoutcar_perception/models/yolov5_detect");
-            left_image_topic_ = declare_parameter<std::string>("left_image_topic", "/camera/mipi/image_raw");
-            right_image_topic_ = declare_parameter<std::string>("right_image_topic", "/camera/usb/image_raw");
+            front_image_topic_ = declare_parameter<std::string>("front_image_topic", "/camera/front/image_raw");
+            turn_image_topic_ = declare_parameter<std::string>("turn_image_topic", "/camera/turn/image_raw");
             
 
             pub_detection_ = create_publisher<sensor_msgs::msg::Image>("yolov5/detection", 10);
-            sub_left_image_ = create_subscription<sensor_msgs::msg::Image>(
-                left_image_topic_, rclcpp::QoS(1).best_effort(),
+            sub_front_image_ = create_subscription<sensor_msgs::msg::Image>(
+                front_image_topic_, rclcpp::QoS(1).best_effort(),
                 [this](const sensor_msgs::msg::Image::SharedPtr msg) {
                     process_frame(msg);
                 });
-            sub_right_image_ = create_subscription<sensor_msgs::msg::Image>(
-                right_image_topic_, rclcpp::QoS(1).best_effort(),
+            sub_turn_image_ = create_subscription<sensor_msgs::msg::Image>(
+                turn_image_topic_, rclcpp::QoS(1).best_effort(),
                 [this](const sensor_msgs::msg::Image::SharedPtr msg) {
                     process_frame(msg);
                 });
@@ -94,13 +94,13 @@ class DetectNode : public rclcpp::Node
         }
 
         std::string model_path_;
-        std::string left_image_topic_;
-        std::string right_image_topic_;
+        std::string front_image_topic_;
+        std::string turn_image_topic_;
         bool model_ok_ = false;
         rknn_app_context_t rknn_app_ctx_{};
         rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_detection_;
-        rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_left_image_;
-        rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_right_image_;
+        rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_front_image_;
+        rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_turn_image_;
 
 
 

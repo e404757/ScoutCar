@@ -27,7 +27,6 @@ set(TIMER_INCLUDES   ${SCOUTCAR_3RDPARTY_DIR}/timer)
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(message_filters REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -60,11 +59,46 @@ target_include_directories(yolov5_seg PRIVATE
 )
 target_link_libraries(yolov5_seg PUBLIC imageutils fileutils)
 
-# add_library(yolov5_detect STATIC
-#     vendor/yolov5_detect/yolov5.cc
-#     vendor/yolov5_detect/postprocess.cc
-# )
-# target_include_directories(yolov5_detect PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/yolov5_detect)
+add_library(segmentation_model STATIC
+    src/segmentation_model.cpp
+)
+target_include_directories(segmentation_model PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/yolov5_seg
+    ${RKNN_INCLUDES}
+)
+target_link_libraries(segmentation_model PUBLIC
+    yolov5_seg
+    ${LIBRKNNRT}
+)
+
+# ── YOLOv8 检测算法：vendor RKNN实现 + 项目级C++封装 ──
+add_library(yolov8_detect_vendor STATIC
+    vendor/yolov8_detect/yolov8.cc
+    vendor/yolov8_detect/postprocess.cc
+)
+target_include_directories(yolov8_detect_vendor PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/yolov8_detect
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/common
+    ${RKNN_INCLUDES}
+)
+target_link_libraries(yolov8_detect_vendor PUBLIC
+    imageutils
+    fileutils
+    ${LIBRKNNRT}
+)
+
+add_library(yolov8_model STATIC
+    src/yolov8_model.cpp
+)
+target_include_directories(yolov8_model PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/yolov8_detect
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/common
+    ${RKNN_INCLUDES}
+)
+target_link_libraries(yolov8_model PUBLIC yolov8_detect_vendor)
+
 
 
 add_library(mobilenet_classifier STATIC
@@ -91,22 +125,23 @@ target_include_directories(perception_visualization PUBLIC
     ${OpenCV_INCLUDE_DIRS}
 )
 ament_target_dependencies(perception_visualization sensor_msgs)
-target_link_libraries(perception_visualization PUBLIC
+target_link_libraries(perception_visualization
     road_tracking
     ${OpenCV_LIBS}
 )
 
-# ── 感知节点：收 /camera/image_raw → 推理 → 发 /perception/seg_mask ──
+# ── 感知节点：图像 → Seg → IPM → RoadTracker → 发布道路偏差 ──
 add_executable(perception_node src/perception_node.cpp)
-target_include_directories(perception_node PRIVATE ${RKNN_INCLUDES})
 target_include_directories(perception_node PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 ament_target_dependencies(perception_node ament_index_cpp rclcpp sensor_msgs std_msgs scoutcar_msgs)
 target_link_libraries(perception_node
-    yolov5_seg road_tracking imageutils fileutils
+    segmentation_model
+    yolov8_model
+    road_tracking
     ${OpenCV_LIBS}
-    ${LIBRKNNRT}
+    perception_visualization
     pthread
     dl
 )
@@ -118,25 +153,7 @@ target_link_options(perception_node PRIVATE
     "LINKER:--exclude-libs,libturbojpeg.a"
 )
 
-add_executable(visualizer_node src/visualizer_node.cpp)
-target_include_directories(visualizer_node PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OpenCV_INCLUDE_DIRS}
-)
-ament_target_dependencies(
-    visualizer_node
-    message_filters
-    rclcpp
-    scoutcar_msgs
-    sensor_msgs
-    std_msgs
-)
-target_link_libraries(visualizer_node
-    perception_visualization
-    ${OpenCV_LIBS}
-)
-
-# ── MobileNet 分类节点：收 MIPI 图像 → 分类 → 发布最佳类别 ──
+# ── MobileNet 分类节点：收正前方图像 → 分类 → 发布最佳类别 ──
 add_executable(classify_node src/classify_node.cpp)
 ament_target_dependencies(classify_node ament_index_cpp rclcpp sensor_msgs std_msgs)
 target_link_libraries(classify_node
@@ -146,11 +163,11 @@ target_link_libraries(classify_node
     dl
 )
 
-install(TARGETS perception_node visualizer_node classify_node
+install(TARGETS perception_node classify_node
   DESTINATION lib/${PROJECT_NAME})
 
 # 模型和标签由 ament 资源索引定位；RKNN 运行库随节点安装，避免依赖旧工程路径。
-install(DIRECTORY models resources
+install(DIRECTORY models
   DESTINATION share/${PROJECT_NAME})
 install(FILES ${LIBRKNNRT}
   DESTINATION lib/${PROJECT_NAME})

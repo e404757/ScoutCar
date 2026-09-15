@@ -151,7 +151,12 @@ void uart_send_deviation_frame(int fd, int16_t deviation)
     size_t len = pathplan::packDeviation(buf, deviation);
     uart_send_frame(fd, buf, len);
 }
-
+void uart_send_detect_task(int fd,pathplan::DetectStatus st,uint8_t left_result,uint8_t right_result)
+{
+    uint8_t buf[pathplan::kMaxFrameLen];
+    size_t len = pathplan::packDetectTask(buf,st,left_result,right_result);
+    uart_send_frame(fd, buf, len);
+}
 // ═══════════════ 接收线程 ═══════════════
 
 // 解析下位机帧: FF 01 00 [flag] 00 DD

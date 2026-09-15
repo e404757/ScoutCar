@@ -1,19 +1,5 @@
 #pragma once
 
-// 上下位机通信协议帧定义与打包/解包接口。
-//
-// 帧格式（用户约定，以用户为准）：
-//   帧头 = 单字节 0xFF
-//   第二位 = 数据类型（0x01 调试 / 0x02 路径 / 0x03 中心偏差）
-//   帧尾 = 0xDD
-//
-//   就绪/调试帧(上电发一次): FF 01 AA 0A 0C DD    AA=就绪, BB=故障; 0A 0C 保留
-//   路径段帧(每格点一段):     FF 02 [起点][终点][动作] DD
-//   中心偏差帧(持续):         FF 03 [AA负/BB正][lo][hi] DD
-//   下位机回传:               FF 01 00 [flag] 00 DD   flag 11/22=pt 0.8/0.4, AA=启动, DD=到达
-//
-// 本文件只提供打包/解包，不涉及串口收发（串口见 serial.cc 的 uart_send_frame）。
-
 #include <cstddef>
 #include <cstdint>
 
@@ -22,17 +8,23 @@ namespace pathplan {
 constexpr uint8_t kFrameHead = 0xFF;
 constexpr uint8_t kFrameTail = 0xDD;
 
-// 数据类型（帧头后第二字节）
+
+//程序状态
+enum class Status : uint8_t {
+    READY = 0xAA,  // 程序就绪，随时可开始
+    ERROR = 0xBB,  // 程序出问题，无法通信
+};
+//侦察任务状态
+enum class DetectStatus : uint8_t {
+    START = 0xAA,  // 侦察任务开始
+    END = 0xBB,    // 侦察任务结束
+};
+// 数据类型
 enum class MsgType : uint8_t {
     DEBUG         = 0x01,  // 调试
     PATH_PLANNING = 0x02,  // 路径段
     DEVIATION     = 0x03,  // 中心偏差
-};
-
-// 就绪/故障状态（调试帧第 3 字节）
-enum class Status : uint8_t {
-    READY = 0xAA,  // 程序就绪，随时可开始
-    ERROR = 0xBB,  // 程序出问题，无法通信
+    DETECT        = 0x04,  // 目标识别
 };
 
 // 下位机回传 flag（接收帧 `FF 01 00 [flag] 00 DD` 的 flag 字节）
@@ -139,6 +131,15 @@ inline size_t packDeviation(uint8_t* buf, int16_t deviation) {
         static_cast<uint8_t>((abs_val >> 8) & 0xFF),
     };
     return packFrame(buf, MsgType::DEVIATION, payload, sizeof(payload));
+}
+
+inline size_t packDetectTask(uint8_t* buf,DetectStatus st,uint8_t left_result,uint8_t right_result) {
+    const uint8_t payload[3] = {
+        static_cast<uint8_t>(st),
+        left_result,
+        right_result,
+    };
+    return packFrame(buf, MsgType::DETECT, payload, sizeof(payload));
 }
 
 }  // namespace pathplan

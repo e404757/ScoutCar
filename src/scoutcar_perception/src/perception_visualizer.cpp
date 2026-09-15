@@ -10,54 +10,53 @@
 
 namespace scoutcar_perception {
 
-void PerceptionVisualizer::draw_inference_fps(
-    cv::Mat & image, double inference_fps) {
-  char text[32];
-  std::snprintf(text, sizeof(text), "FPS %.1f", inference_fps);
-  cv::putText(image, text, {12, 30}, cv::FONT_HERSHEY_SIMPLEX,
-              0.8, {255, 255, 255}, 2, cv::LINE_AA);
-}
+void PerceptionVisualizer::draw_deviation(cv::Mat &image,
+                                          const road_tracking::Result &result,
+                                          int reference_x,
+                                          const cv::Mat &coordinate_transform) {
+  if (!result.valid || image.empty()) {
+    return;
+  }
 
-void PerceptionVisualizer::draw_driving_state(
-    cv::Mat & image, bool deviation_enabled) {
-  const std::string text = deviation_enabled ? "AHEADING" : "TURNING";
-  const cv::Scalar color = deviation_enabled
-                               ? cv::Scalar(0, 255, 0)
-                               : cv::Scalar(0, 0, 255);
-  const double font_scale = 0.8;
-  const int thickness = 2;
+  std::vector<cv::Point2f> points{
+      {static_cast<float>(reference_x), static_cast<float>(result.y)},
+      {static_cast<float>(result.center_x), static_cast<float>(result.y)}};
+  if (!coordinate_transform.empty()) {
+    cv::perspectiveTransform(points, points, coordinate_transform);
+  }
+
+  const cv::Point reference_point{
+      std::clamp(cvRound(points[0].x), 0, image.cols - 1),
+      std::clamp(cvRound(points[0].y), 0, image.rows - 1)};
+  const cv::Point road_center_point{
+      std::clamp(cvRound(points[1].x), 0, image.cols - 1),
+      std::clamp(cvRound(points[1].y), 0, image.rows - 1)};
+
+  cv::line(image, reference_point, road_center_point, {0, 255, 255}, 3,
+           cv::LINE_AA);
+  cv::drawMarker(image, reference_point, {255, 255, 255},
+                 cv::MARKER_CROSS, 11, 2, cv::LINE_AA);
+  cv::drawMarker(image, road_center_point, {0, 255, 0},
+                 cv::MARKER_CROSS, 11, 2, cv::LINE_AA);
+
+  const std::string text = "DEV " + std::to_string(result.deviation) + " px";
   int baseline = 0;
   const cv::Size text_size = cv::getTextSize(
-      text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
-  const int x = (image.cols - text_size.width) / 2;
-
-  cv::putText(image, text, {x, 30}, cv::FONT_HERSHEY_SIMPLEX,
-              font_scale, color, thickness, cv::LINE_AA);
-}
-
-void PerceptionVisualizer::draw_deviation(
-    cv::Mat & image, const road_tracking::Result & result) {
-  const std::string text = result.valid
-                               ? "DEV " + std::to_string(result.deviation) + " px"
-                               : "DEV N/A";
-  cv::putText(image, text, {12, 60}, cv::FONT_HERSHEY_SIMPLEX,
+      text, cv::FONT_HERSHEY_SIMPLEX, 0.7, 2, &baseline);
+  const cv::Point line_middle = (reference_point + road_center_point) * 0.5;
+  const int text_x =
+      std::clamp(line_middle.x - text_size.width / 2, 0,
+                 std::max(0, image.cols - text_size.width));
+  const int text_y = std::clamp(line_middle.y - 10, text_size.height,
+                                image.rows - 1);
+  cv::putText(image, text, {text_x, text_y}, cv::FONT_HERSHEY_SIMPLEX,
               0.7, {0, 255, 255}, 2, cv::LINE_AA);
 }
 
-void PerceptionVisualizer::draw_frame_info(
-    cv::Mat & image, double inference_fps, bool deviation_enabled) {
-  draw_inference_fps(image, inference_fps);
-  draw_driving_state(image, deviation_enabled);
-}
-
-sensor_msgs::msg::Image PerceptionVisualizer::make_source_debug(
-    const sensor_msgs::msg::Image & source,
-    const uint8_t * mask,
-    const uint8_t * processed_ipm_mask,
-    const road_tracking::Result & result,
-    const cv::Mat & ipm_inverse,
-    double inference_fps,
-    bool deviation_enabled) const {
+sensor_msgs::msg::Image PerceptionVisualizer::make_mask_debug(
+    const sensor_msgs::msg::Image &source, const uint8_t *mask,
+    const uint8_t *processed_ipm_mask, const road_tracking::Result &result,
+    int reference_x, const cv::Mat &ipm_inverse) const {
   const int width = static_cast<int>(source.width);
   const int height = static_cast<int>(source.height);
   cv::Mat rgb(height, width, CV_8UC3,
@@ -66,15 +65,14 @@ sensor_msgs::msg::Image PerceptionVisualizer::make_source_debug(
   cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
 
   if (mask == nullptr) {
-    draw_frame_info(bgr, inference_fps, deviation_enabled);
-    draw_deviation(bgr, result);
+    draw_deviation(bgr, result, reference_x, ipm_inverse);
     return make_rgb8_debug(source, bgr);
   }
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
       const uint8_t value = mask[static_cast<size_t>(y) * width + x];
-      cv::Vec3b & pixel = bgr.at<cv::Vec3b>(y, x);
+      cv::Vec3b &pixel = bgr.at<cv::Vec3b>(y, x);
       if (value == 1) {
         pixel = cv::Vec3b(0, 255, 0);
       } else if (value == 2) {
@@ -85,9 +83,8 @@ sensor_msgs::msg::Image PerceptionVisualizer::make_source_debug(
 
   cv::Mat processed_source;
   if (processed_ipm_mask) {
-    cv::Mat processed_ipm(
-        height, width, CV_8UC1,
-        const_cast<uint8_t *>(processed_ipm_mask));
+    cv::Mat processed_ipm(height, width, CV_8UC1,
+                          const_cast<uint8_t *>(processed_ipm_mask));
     cv::warpPerspective(processed_ipm, processed_source, ipm_inverse,
                         cv::Size(width, height), cv::INTER_NEAREST,
                         cv::BORDER_CONSTANT, cv::Scalar(0));
@@ -101,41 +98,14 @@ sensor_msgs::msg::Image PerceptionVisualizer::make_source_debug(
     }
   }
 
-  const int y = std::clamp(result.y, 0, height - 1);
-  const int cx = width / 2;
-  std::vector<cv::Point2f> bird_points{
-    {0.0f, static_cast<float>(y)},
-    {static_cast<float>(width - 1), static_cast<float>(y)},
-    {static_cast<float>(cx), 0.0f},
-    {static_cast<float>(cx), static_cast<float>(height - 1)}};
-  cv::perspectiveTransform(bird_points, bird_points, ipm_inverse);
-  cv::line(bgr, bird_points[0], bird_points[1], {0, 255, 255}, 1);
-  cv::line(bgr, bird_points[2], bird_points[3], {255, 255, 255}, 1);
-
-  if (result.left >= 0 && result.right >= 0) {
-    std::vector<cv::Point2f> selected{
-      {static_cast<float>(result.left), static_cast<float>(y)},
-      {static_cast<float>(result.right), static_cast<float>(y)},
-      {static_cast<float>(result.center_x), static_cast<float>(y)},
-      {static_cast<float>(cx), static_cast<float>(y)}};
-    cv::perspectiveTransform(selected, selected, ipm_inverse);
-    cv::line(bgr, selected[0], selected[1], {0, 255, 255}, 2);
-    cv::drawMarker(
-        bgr, selected[2], {0, 255, 0}, cv::MARKER_CROSS, 11, 2);
-    cv::drawMarker(
-        bgr, selected[3], {255, 255, 255}, cv::MARKER_CROSS, 11, 2);
-  }
-
-  draw_frame_info(bgr, inference_fps, deviation_enabled);
-  draw_deviation(bgr, result);
+  draw_deviation(bgr, result, reference_x, ipm_inverse);
   return make_rgb8_debug(source, bgr);
 }
 
 sensor_msgs::msg::Image PerceptionVisualizer::make_ipm_debug(
-    const sensor_msgs::msg::Image & source,
-    const uint8_t * mask,
-    const uint8_t * processed_mask,
-    const road_tracking::Result & result) const {
+    const sensor_msgs::msg::Image &source, const uint8_t *mask,
+    const uint8_t *processed_mask, const road_tracking::Result &result,
+    int reference_x) const {
   const int width = static_cast<int>(source.width);
   const int height = static_cast<int>(source.height);
   cv::Mat bgr(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -154,26 +124,72 @@ sensor_msgs::msg::Image PerceptionVisualizer::make_ipm_debug(
         }
       }
     }
-
-    const int y = std::clamp(result.y, 0, height - 1);
-    const int cx = width / 2;
-    cv::line(bgr, {0, y}, {width - 1, y}, {0, 255, 255}, 1);
-    cv::line(bgr, {cx, 0}, {cx, height - 1}, {255, 255, 255}, 1);
-    if (result.left >= 0 && result.right >= 0) {
-      cv::line(
-          bgr, {result.left, y}, {result.right, y}, {0, 255, 255}, 3);
-      cv::drawMarker(bgr, {result.center_x, y}, {0, 255, 0},
-                     cv::MARKER_CROSS, 11, 2);
-    }
   }
 
-  draw_deviation(bgr, result);
+  draw_deviation(bgr, result, reference_x, cv::Mat{});
 
   return make_rgb8_debug(source, bgr);
 }
 
-sensor_msgs::msg::Image PerceptionVisualizer::make_rgb8_debug(
-    const sensor_msgs::msg::Image & source, const cv::Mat & bgr) {
+sensor_msgs::msg::Image PerceptionVisualizer::make_detection_debug(
+    const sensor_msgs::msg::Image &source,
+    const DetectionResult &result) const {
+  const int width = static_cast<int>(source.width);
+  const int height = static_cast<int>(source.height);
+  cv::Mat rgb(height, width, CV_8UC3,
+              const_cast<uint8_t *>(source.data.data()),
+              static_cast<size_t>(source.step));
+  cv::Mat bgr;
+  cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+
+  for (const auto &detection : result.detections) {
+    const int left = std::clamp(detection.left, 0, width - 1);
+    const int top = std::clamp(detection.top, 0, height - 1);
+    const int right = std::clamp(detection.right, 0, width - 1);
+    const int bottom = std::clamp(detection.bottom, 0, height - 1);
+    if (right <= left || bottom <= top) {
+      continue;
+    }
+
+    const cv::Scalar color(0, 255, 0);
+    cv::rectangle(bgr, {left, top}, {right, bottom}, color, 2, cv::LINE_AA);
+
+    char confidence[16];
+    std::snprintf(confidence, sizeof(confidence), "%.1f%%",
+                  detection.confidence * 100.0F);
+    const std::string label =
+        (detection.class_name.empty() ? "unknown" : detection.class_name) +
+        " " + confidence;
+
+    int baseline = 0;
+    const double font_scale = 0.55;
+    const int thickness = 1;
+    const cv::Size text_size = cv::getTextSize(
+        label, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
+    const int text_x = left;
+    const int text_y =
+        top > text_size.height + baseline + 4
+            ? top - 4
+            : std::min(height - baseline - 1, top + text_size.height + 4);
+    const int background_top =
+        std::max(0, text_y - text_size.height - baseline - 3);
+    const int background_right =
+        std::min(width - 1, text_x + text_size.width + 4);
+    const int background_bottom = std::min(height - 1, text_y + baseline + 1);
+
+    cv::rectangle(bgr, {text_x, background_top},
+                  {background_right, background_bottom}, color, cv::FILLED);
+    cv::putText(bgr, label, {text_x + 2, text_y},
+                cv::FONT_HERSHEY_SIMPLEX, font_scale, {0, 0, 0}, thickness,
+                cv::LINE_AA);
+  }
+
+  return make_rgb8_debug(source, bgr);
+}
+
+sensor_msgs::msg::Image
+PerceptionVisualizer::make_rgb8_debug(const sensor_msgs::msg::Image &source,
+                                      const cv::Mat &bgr) {
   cv::Mat debug_rgb;
   cv::cvtColor(bgr, debug_rgb, cv::COLOR_BGR2RGB);
   sensor_msgs::msg::Image debug;
@@ -182,10 +198,9 @@ sensor_msgs::msg::Image PerceptionVisualizer::make_rgb8_debug(
   debug.height = source.height;
   debug.encoding = "rgb8";
   debug.step = source.width * 3;
-  debug.data.assign(
-      debug_rgb.data,
-      debug_rgb.data + debug_rgb.total() * debug_rgb.elemSize());
+  debug.data.assign(debug_rgb.data,
+                    debug_rgb.data + debug_rgb.total() * debug_rgb.elemSize());
   return debug;
 }
 
-}  // namespace scoutcar_perception
+} // namespace scoutcar_perception

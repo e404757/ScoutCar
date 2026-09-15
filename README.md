@@ -23,26 +23,33 @@ CityScout 的 ROS 2 Humble 版本，运行于 Orange Pi 5 Pro（RK3588）。工�
 ## 构建
 
 ```bash
+# 进入工程目录
 cd /home/orangepi/CityScout
-source env.sh
+
+# 将 CPU、NPU、GPU 和 DDR 设置为 performance 调频策略
+sudo /home/orangepi/CityScout/deploy/set_performance.sh
+
+# 构建全部包
 colcon build --symlink-install
+
+colcon build --symlink-install --packages-select scoutcar_msgs
+colcon build --symlink-install --packages-select scoutcar_camera
+colcon build --symlink-install --packages-select scoutcar_control
+colcon build --symlink-install --packages-select scoutcar_perception
+colcon build --symlink-install --packages-select scoutcar_planning
+colcon build --symlink-install --packages-select scoutcar_web
+colcon build --symlink-install --packages-select scoutcar_bringup
 ```
 
 ## 启动
-
-仅启动双相机：
-
-```bash
-ros2 launch scoutcar_bringup cameras.launch.py
-```
-
-启动完整链路：
-
 ```bash
 systemctl stop cityscout-cameras.service
-ros2 launch scoutcar_bringup cityscout.launch.py
-ros2 launch scoutcar_web web.launch.py 
+ros2 launch scoutcar_bringup cityscout.launch.py web:=true
+
 ```
+
+pgrep -a -f 'codex|Codex|chatgpt|ChatGPT'
+kill -9 12345
 
 
 

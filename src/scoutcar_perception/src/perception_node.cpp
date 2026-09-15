@@ -1,11 +1,8 @@
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <opencv2/opencv.hpp>
@@ -13,270 +10,396 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <scoutcar_msgs/msg/road_deviation.hpp>
+#include <scoutcar_msgs/msg/detect_task.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/header.hpp>
-#include <scoutcar_msgs/msg/road_deviation.hpp>
 
-#include "image_utils.h"
+#include "scoutcar_perception/perception_visualizer.hpp"
 #include "scoutcar_perception/road_tracker.hpp"
-#include "yolov5_seg.h"
+#include "scoutcar_perception/segmentation_model.hpp"
+#include "scoutcar_perception/yolov8_model.hpp"
 
-class PerceptionNode : public rclcpp::Node
-{
+class PerceptionNode : public rclcpp::Node {
 public:
-  PerceptionNode() : Node("perception_node")
-  {
-    const auto package_share =
-      ament_index_cpp::get_package_share_directory("scoutcar_perception");
-    model_path_ = declare_parameter<std::string>(
-      "model_path", package_share + "/models/yolov5seg_V1.0/seg_V1.0.rknn");
-    label_path_ = declare_parameter<std::string>(
-      "label_path", package_share + "/resources/detect_label.txt");
-    usb_image_topic_ = declare_parameter<std::string>(
-      "usb_image_topic", "/camera/usb/image_raw");
-    mipi_image_topic_ = declare_parameter<std::string>(
-      "mipi_image_topic", "/camera/mipi/image_raw");
+  PerceptionNode() : Node("perception_node") {
 
+    //初始化Seg模型
+    const auto package_share =
+        ament_index_cpp::get_package_share_directory("scoutcar_perception");
+    seg_model_path_ = declare_parameter<std::string>(
+        "seg_model_path", package_share + "/models/yolov5_seg/V1.0/seg_V1.0.rknn");
+    seg_label_path_ = declare_parameter<std::string>(
+        "seg_label_path", package_share + "/models/yolov5_seg/V1.0/seg_label.txt");
+    scoutcar_perception::SegmentationConfig segmentation_config;
+    segmentation_config.model_path = seg_model_path_;
+    segmentation_config.label_path = seg_label_path_;
+    segmentation_model_ =
+        std::make_unique<scoutcar_perception::SegmentationModel>(
+            segmentation_config);
+    if (!segmentation_model_->is_initialized()) {
+    throw std::runtime_error("Seg模型初始化失败: " +
+                            segmentation_model_->initialization_error());
+    }
+    RCLCPP_INFO(get_logger(), "Seg模型初始化成功");
+
+    // 初始化YOLOv8检测模型
+    detect_model_path_ = declare_parameter<std::string>(
+        "detect_model_path",
+        package_share + "/models/yolov8_detect/V1.0/yolo8_v1.0_int8.rknn");
+    detect_label_path_ = declare_parameter<std::string>(
+        "detect_label_path",
+        package_share + "/models/yolov8_detect/V1.0/labels.txt");
+    detect_confidence_threshold_ =
+        declare_parameter<double>("detect.confidence_threshold", 0.25);
+    detect_nms_threshold_ =
+        declare_parameter<double>("detect.nms_threshold", 0.45);
+    scoutcar_perception::YoloV8Config detection_config;
+    detection_config.model_path = detect_model_path_;
+    detection_config.label_path = detect_label_path_;
+    detection_config.confidence_threshold =
+        static_cast<float>(detect_confidence_threshold_);
+    detection_config.nms_threshold = static_cast<float>(detect_nms_threshold_);
+    detection_model_ =
+        std::make_unique<scoutcar_perception::YoloV8Model>(detection_config);
+    if (!detection_model_->is_initialized()) {
+      throw std::runtime_error(
+          "YOLOv8模型初始化失败: " +
+          detection_model_->initialization_error());
+    }
+    RCLCPP_INFO(get_logger(), "YOLOv8模型初始化成功");
+
+    //读取track参数
     road_tracking::Config tracking_config;
     tracking_config.scan_end_y =
-      declare_parameter<int>("road_tracking.scan_end_y", 120);
+        declare_parameter<int>("road_tracking.scan_end_y", 120);
     tracking_config.min_road_width_px =
-      declare_parameter<int>("road_tracking.min_road_width_px", 225);
+        declare_parameter<int>("road_tracking.min_road_width_px", 225);
     tracking_config.max_road_width_px =
-      declare_parameter<int>("road_tracking.max_road_width_px", 285);
+        declare_parameter<int>("road_tracking.max_road_width_px", 285);
     tracking_config.min_barrier_width_px =
-      declare_parameter<int>("road_tracking.min_barrier_width_px", 12);
+        declare_parameter<int>("road_tracking.min_barrier_width_px", 12);
     tracking_config.search_expand_px =
-      declare_parameter<int>("road_tracking.search_expand_px", 20);
+        declare_parameter<int>("road_tracking.search_expand_px", 20);
     tracking_config.min_valid_rows =
-      declare_parameter<int>("road_tracking.min_valid_rows", 60);
-    road_tracker_ = std::make_unique<road_tracking::RoadTracker>(tracking_config);
+        declare_parameter<int>("road_tracking.min_valid_rows", 60);
+    front_reference_x_ =
+        declare_parameter<int>("road_tracking.front_reference_x", 320);
+    turn_reference_x_ =
+        declare_parameter<int>("road_tracking.turn_reference_x", 320);
+    road_tracker_ =
+        std::make_unique<road_tracking::RoadTracker>(tracking_config);
 
-    const auto mipi_source = declare_parameter<std::vector<double>>(
-      "ipm.mipi_source_points", {276.0, 190.0, 404.0, 190.0, 163.0, 440.0, 599.0, 440.0});
-    const auto usb_source = declare_parameter<std::vector<double>>(
-      "ipm.usb_source_points", {239.0, 120.0, 411.0, 120.0, 50.0, 420.0, 511.0, 420.0});
-    const auto destination = declare_parameter<std::vector<double>>(
-      "ipm.destination_points", {180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0});
-    if (mipi_source.size() != 8 || usb_source.size() != 8 || destination.size() != 8) {
-      throw std::runtime_error("两路 ipm source_points 和 destination_points 必须各有 8 个数");
+    build_ipm_matrices();
+
+    pub_deviation_ = create_publisher<scoutcar_msgs::msg::RoadDeviation>(
+        "perception/road_boundary", 10);
+    const auto debug_qos = rclcpp::QoS(1).best_effort();
+    pub_mask_debug_ = create_publisher<sensor_msgs::msg::Image>(
+        "perception/debug_image", debug_qos);
+    pub_ipm_debug_ = create_publisher<sensor_msgs::msg::Image>(
+        "perception/ipm_debug_image", debug_qos);
+    pub_front_detection_ = create_publisher<sensor_msgs::msg::Image>(
+        "perception/front_detection_image", debug_qos);
+    pub_turn_detection_ = create_publisher<sensor_msgs::msg::Image>(
+        "perception/turn_detection_image", debug_qos);
+    pub_detect_results_ = create_publisher<scoutcar_msgs::msg::DetectTask>(
+      "perception/detect_results",10);
+    const auto status_qos =
+        rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    sub_cam_status_ = create_subscription<std_msgs::msg::Bool>(
+        "mission/cam_status", status_qos,
+        [this](const std_msgs::msg::Bool::SharedPtr msg) {
+          cam_turned_ = msg->data;
+        });
+    sub_turn_image_ = create_subscription<sensor_msgs::msg::Image>(
+        "/camera/turn/image_raw",
+        rclcpp::QoS(1)
+            .best_effort(), // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
+        [this](const sensor_msgs::msg::Image::SharedPtr msg) {
+          if (detect_status_) {
+            process_Detectframe(msg, pub_turn_detection_, "转向相机");
+          } else if (cam_turned_) {
+            process_Segframe(msg);
+          }
+        });
+    sub_front_image_ = create_subscription<sensor_msgs::msg::Image>(
+        "/camera/front/image_raw",
+        rclcpp::QoS(1)
+            .best_effort(), // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
+        [this](const sensor_msgs::msg::Image::SharedPtr msg) {
+          if (detect_status_) {
+            process_Detectframe(msg, pub_front_detection_, "前视相机");
+          } else if (!cam_turned_) {
+            process_Segframe(msg);
+          }
+        });
+    sub_detect_task_ = create_subscription<scoutcar_msgs::msg::DetectTask>(
+        "/mission/detect_task", status_qos,
+        [this](const scoutcar_msgs::msg::DetectTask::SharedPtr msg) {
+          if (msg->status == scoutcar_msgs::msg::DetectTask::START) {
+            detect_status_ = true;
+            RCLCPP_INFO(get_logger(), "侦察开始，切换到两路YOLOv8检测");
+          } else if (msg->status == scoutcar_msgs::msg::DetectTask::END) {
+            detect_status_ = false;
+            RCLCPP_INFO(get_logger(), "侦察结束，恢复Seg感知");
+          } else {
+            RCLCPP_WARN(get_logger(), "忽略未知侦察状态: 0x%02X",
+                        msg->status);
+          }
+        });
+  }
+
+  ~PerceptionNode() override = default;
+
+private:
+  void build_ipm_matrices() {
+    const auto front_source = declare_parameter<std::vector<double>>(
+        "ipm.front_source_points",
+        {232.0, 190.0, 431.0, 190.0, 95.0, 420.0, 588.0, 420.0});
+    const auto turn_source = declare_parameter<std::vector<double>>(
+        "ipm.turn_source_points",
+        {260.0, 190.0, 400.0, 190.0, 145.0, 420.0, 520.0, 420.0});
+    const auto front_destination = declare_parameter<std::vector<double>>(
+        "ipm.front_destination_points",
+        {180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0});
+    const auto turn_destination = declare_parameter<std::vector<double>>(
+        "ipm.turn_destination_points",
+        {170.0, 120.0, 470.0, 120.0, 170.0, 470.0, 470.0, 470.0});
+
+    if (front_source.size() != 8 || turn_source.size() != 8 ||
+        front_destination.size() != 8 || turn_destination.size() != 8) {
+      throw std::runtime_error(
+          "front/turn source_points 和 destination_points 必须各有 8 个数");
     }
-    std::vector<cv::Point2f> destination_points;
-    for (size_t i = 0; i < 8; i += 2) {
-      destination_points.emplace_back(destination[i], destination[i + 1]);
-    }
-    const auto make_ipm = [&destination_points](const std::vector<double> & source) {
+
+    const auto make_ipm = [](const std::vector<double> &source,
+                             const std::vector<double> &destination) {
       std::vector<cv::Point2f> source_points;
-      for (size_t i = 0; i < 8; i += 2) {
+      std::vector<cv::Point2f> destination_points;
+      for (size_t i = 0; i < source.size(); i += 2) {
         source_points.emplace_back(source[i], source[i + 1]);
+        destination_points.emplace_back(destination[i], destination[i + 1]);
       }
       return cv::getPerspectiveTransform(source_points, destination_points);
     };
-    mipi_ipm_matrix_ = make_ipm(mipi_source);
-    usb_ipm_matrix_ = make_ipm(usb_source);
-    pub_seg_ = create_publisher<sensor_msgs::msg::Image>("perception/seg_mask", 10);
-    pub_source_ = create_publisher<sensor_msgs::msg::Image>("perception/source_image", 5);
-    pub_ipm_mask_ = create_publisher<sensor_msgs::msg::Image>("perception/ipm_mask", 5);
-    pub_processed_mask_ = create_publisher<sensor_msgs::msg::Image>(
-      "perception/processed_mask", 5);
-    pub_deviation_ = create_publisher<scoutcar_msgs::msg::RoadDeviation>(
-      "perception/road_boundary", 10);
-    const auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
-    sub_cam_status_ = create_subscription<std_msgs::msg::Bool>("mission/cam_status", status_qos,
-      [this](const std_msgs::msg::Bool::SharedPtr msg) {
-        cam_turned_ = msg->data;
-      });
-    sub_usb_image_ = create_subscription<sensor_msgs::msg::Image>(
-      usb_image_topic_, rclcpp::QoS(1).best_effort(),   // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
-      [this](const sensor_msgs::msg::Image::SharedPtr msg) {  
-        if(cam_turned_){
-          process_frame(msg); 
-        }});
-    sub_mipi_image_ = create_subscription<sensor_msgs::msg::Image>(
-      mipi_image_topic_, rclcpp::QoS(1).best_effort(),   // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
-    [this](const sensor_msgs::msg::Image::SharedPtr msg) { if(!cam_turned_){
-          process_frame(msg); 
-        }});
-    if (init_post_process(label_path_.c_str()) != 0) {
-      RCLCPP_ERROR(get_logger(), "类别标签加载失败: %s", label_path_.c_str());
-      return;
-    }
-    post_process_ok_ = true;
-    if (init_yolov5_seg_model(model_path_.c_str(), &rknn_ctx_) != 0) {
-      RCLCPP_ERROR(get_logger(), "模型加载失败: %s", model_path_.c_str());
-      model_ok_ = false;
-    } else {
-      model_ok_ = true;
-      RCLCPP_INFO(get_logger(), "模型加载成功");
+
+    front_ipm_matrix_ = make_ipm(front_source, front_destination);
+    turn_ipm_matrix_ = make_ipm(turn_source, turn_destination);
+    front_ipm_inverse_ = front_ipm_matrix_.inv();
+    turn_ipm_inverse_ = turn_ipm_matrix_.inv();
+  }
+
+  bool should_make_debug() const {
+    return pub_mask_debug_->get_subscription_count() > 0 ||
+           pub_ipm_debug_->get_subscription_count() > 0;
+  }
+
+
+  void publish_debug_images(const sensor_msgs::msg::Image &source,
+                            const uint8_t *mask, const uint8_t *ipm_mask,
+                            const uint8_t *selected_mask,
+                            const road_tracking::Result &result,
+                            int reference_x, const cv::Mat &ipm_inverse) {
+    try {
+      if (pub_mask_debug_->get_subscription_count() > 0) {
+        auto debug_image = visualizer_.make_mask_debug(
+            source, mask, selected_mask, result, reference_x, ipm_inverse);
+        pub_mask_debug_->publish(std::move(debug_image));
+      }
+      if (pub_ipm_debug_->get_subscription_count() > 0) {
+        auto ipm_debug_image = visualizer_.make_ipm_debug(
+            source, ipm_mask, selected_mask, result, reference_x);
+        pub_ipm_debug_->publish(std::move(ipm_debug_image));
+      }
+    } catch (const cv::Exception &error) {
+      RCLCPP_ERROR(get_logger(), "绘制调试图失败: %s", error.what());
     }
   }
 
-  ~PerceptionNode() override
-  {
-    if (model_ok_) {
-      release_yolov5_seg_model(&rknn_ctx_);
-    }
-    if (post_process_ok_) {
-      deinit_post_process();
-    }
-  }
+  void process_Segframe(const sensor_msgs::msg::Image::SharedPtr msg) {
+    const bool make_debug = should_make_debug();
+    const int configured_reference_x =
+        cam_turned_ ? turn_reference_x_ : front_reference_x_;
+    const cv::Mat &ipm_inverse =
+        cam_turned_ ? turn_ipm_inverse_ : front_ipm_inverse_;
 
-private:
-  void process_frame(const sensor_msgs::msg::Image::SharedPtr msg)
-  {
-    if (!model_ok_) {
-      return;
-    }
-    
-    const size_t bytes = static_cast<size_t>(msg->width) * msg->height * 3;
-    if (msg->encoding != "rgb8" || msg->data.size() < bytes) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "图像格式异常: enc=%s %ux%u",
-                           msg->encoding.c_str(), msg->width, msg->height);
-      return;
-    }
-    uint8_t * frame = static_cast<uint8_t *>(std::malloc(bytes));
-    if (frame == nullptr) {
-      return;
-    }
-    std::memcpy(frame, msg->data.data(), bytes);
-
-    image_buffer_t img{};
-    img.width = static_cast<int>(msg->width);
-    img.height = static_cast<int>(msg->height);
-    img.format = IMAGE_FORMAT_RGB888;
-    img.virt_addr = frame;
-
-    // 2) 推理（CPU 预处理）
-    object_detect_result_list od{};
-    const int ret = inference_yolov5_seg_model_cpu(&rknn_ctx_, &img, &od);
-    std::free(frame);
-    if (ret != 0) {
-      return;
-    }
-    if (od.count < 1) {
-      publish_invalid_boundary(msg->header);
-      sensor_msgs::msg::Image empty_mask;
-      empty_mask.header = msg->header;
-      empty_mask.width = msg->width;
-      empty_mask.height = msg->height;
-      empty_mask.encoding = "mono8";
-      empty_mask.step = msg->width;
-      empty_mask.data.assign(
-          static_cast<size_t>(msg->width) * msg->height, 0);
-      pub_source_->publish(*msg);
-      pub_seg_->publish(empty_mask);
-      if (visualizer_connected()) {
-        pub_ipm_mask_->publish(empty_mask);
-        pub_processed_mask_->publish(empty_mask);
+    auto seg_result = segmentation_model_->infer(msg->data.data(),
+                                                 static_cast<int>(msg->width),
+                                                 static_cast<int>(msg->height));
+    if (!seg_result.error.empty()) {
+      RCLCPP_ERROR(get_logger(), "Seg推理失败: %s", seg_result.error.c_str());
+      publish_deviation(msg->header, scoutcar_msgs::msg::RoadDeviation::STATUS_INFERENCE_ERROR);
+      if (make_debug) {
+        publish_debug_images(*msg, nullptr, nullptr, nullptr,
+                             road_tracking::Result{}, configured_reference_x,
+                             ipm_inverse);
       }
       return;
     }
-
-    // 3) 掩膜 → sensor_msgs/Image（mono8：0背景/1路面/2挡板）
-    uint8_t * seg_mask = od.results_seg[0].seg_mask;
-    auto out = std::make_shared<sensor_msgs::msg::Image>();
-    out->header = msg->header;              // 继承相机帧时间戳
-    out->header.frame_id = "camera";
-    out->width = img.width;
-    out->height = img.height;
-    out->encoding = "mono8";
-    out->step = static_cast<uint32_t>(img.width);
-    out->data.assign(seg_mask, seg_mask + static_cast<size_t>(img.width) * img.height);
-
-    // 4) 原始分割掩膜先变换到俯视图，再从车前方向上筛选主通道。
-    cv::Mat source_mask(img.height, img.width, CV_8UC1, seg_mask);
+    if (!seg_result.valid) {
+      publish_deviation(msg->header, scoutcar_msgs::msg::RoadDeviation::STATUS_NO_SEGMENTATION);
+      if (make_debug) {
+        publish_debug_images(*msg, nullptr, nullptr, nullptr,
+                             road_tracking::Result{}, configured_reference_x,
+                             ipm_inverse);
+      }
+      return;
+    }
+    cv::Mat source_mask(seg_result.height, seg_result.width, CV_8UC1,
+                        seg_result.mask.data());
     cv::Mat ipm_mask;
-    const cv::Mat & ipm_matrix = cam_turned_ ? usb_ipm_matrix_ : mipi_ipm_matrix_;
+    const cv::Mat &ipm_matrix =
+        cam_turned_ ? turn_ipm_matrix_ : front_ipm_matrix_;
     cv::warpPerspective(source_mask, ipm_mask, ipm_matrix, source_mask.size(),
                         cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-    const bool make_visualization_data = visualizer_connected();
-    std::vector<uint8_t> processed_mask;
-    if (make_visualization_data) {
-      processed_mask.assign(
-          static_cast<size_t>(img.width) * img.height, 0);
+
+    const int reference_x =
+        std::clamp(configured_reference_x, 0, seg_result.width - 1);
+    std::vector<uint8_t> selected_mask;
+    if (make_debug) {
+      selected_mask.resize(static_cast<size_t>(seg_result.width) *
+                           seg_result.height);
     }
-    const auto tracked = road_tracker_->process(
-      ipm_mask.data, img.width, img.height, img.width / 2,
-      make_visualization_data ? processed_mask.data() : nullptr);
-    const auto & result = tracked;
-    
-    scoutcar_msgs::msg::RoadDeviation deviation;
-    deviation.header = msg->header;
-    deviation.valid = result.valid;
-    deviation.deviation = deviation.valid ? static_cast<int16_t>(result.deviation) : -999;
-    deviation.road_center = static_cast<uint16_t>(result.center_x);
-    deviation.scan_y = static_cast<uint16_t>(result.y);
-    deviation.left = static_cast<int16_t>(result.left);
-    deviation.right = static_cast<int16_t>(result.right);
-    deviation.width = static_cast<uint16_t>(std::max(0, result.width));
-    deviation.boundary_source = result.used_barrier_gap ? "BARRIER_GAP" : "ROAD_MASK";
-     
+    const auto result = road_tracker_->process(
+        ipm_mask.data, seg_result.width, seg_result.height, reference_x,
+        make_debug ? selected_mask.data() : nullptr);
+
+
+    if (!result.valid) {
+      publish_deviation(
+          msg->header,
+          scoutcar_msgs::msg::RoadDeviation::STATUS_TRACKING_FAILED);
+    } else {
+      publish_deviation(msg->header,
+                        scoutcar_msgs::msg::RoadDeviation::STATUS_OK,
+                        &result);
+    }
+
+    if (make_debug) {
+      publish_debug_images(*msg, seg_result.mask.data(), ipm_mask.data,
+                           selected_mask.data(), result, reference_x,
+                           ipm_inverse);
+    }
+  }
+
+  void process_Detectframe(
+      const sensor_msgs::msg::Image::SharedPtr msg,
+      const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr &publisher,
+      const char *camera_name) {
+    const int width = static_cast<int>(msg->width);
+    const int height = static_cast<int>(msg->height);
+    const size_t row_bytes = static_cast<size_t>(width) * 3U;
+    if (width <= 0 || height <= 0 || msg->encoding != "rgb8" ||
+        msg->step < row_bytes ||
+        msg->data.size() < static_cast<size_t>(msg->step) * height) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "检测图像格式异常: enc=%s %ux%u step=%u size=%zu",
+          msg->encoding.c_str(), msg->width, msg->height, msg->step,
+          msg->data.size());
+      return;
+    }
+
+    const uint8_t *rgb_data = msg->data.data();
+    cv::Mat contiguous_rgb;
+    if (msg->step != row_bytes) {
+      const cv::Mat rgb(height, width, CV_8UC3,
+                        const_cast<uint8_t *>(msg->data.data()), msg->step);
+      contiguous_rgb = rgb.clone();
+      rgb_data = contiguous_rgb.data;
+    }
+
+    const auto detection_result =
+        detection_model_->infer(rgb_data, width, height);
+    if (!detection_result.success) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                            "%s YOLOv8推理失败: %s", camera_name,
+                            detection_result.error.c_str());
+    } else {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "%s YOLOv8检测到 %zu 个目标", camera_name,
+                           detection_result.detections.size());
+    }
+
+    if (publisher->get_subscription_count() > 0) {
+      try {
+        auto debug_image =
+            visualizer_.make_detection_debug(*msg, detection_result);
+        publisher->publish(std::move(debug_image));
+      } catch (const cv::Exception &error) {
+        RCLCPP_ERROR(get_logger(), "%s绘制检测结果失败: %s", camera_name,
+                     error.what());
+      }
+    }
+  }
+
+  void publish_deviation(
+      const std_msgs::msg::Header &header, uint8_t status,
+      const road_tracking::Result *result = nullptr) {
+    scoutcar_msgs::msg::RoadDeviation deviation{};
+    deviation.header = header;
+    deviation.status = status;
+    deviation.front_reference_x = front_reference_x_;
+    deviation.turn_reference_x = turn_reference_x_;
+
+    if (status == scoutcar_msgs::msg::RoadDeviation::STATUS_OK) {
+      if (result == nullptr) {
+        RCLCPP_ERROR(get_logger(), "STATUS_OK 必须提供 RoadTracker 结果");
+        return;
+      }
+      deviation.deviation = static_cast<int16_t>(result->deviation);
+      deviation.road_center =
+          static_cast<uint16_t>(std::max(0, result->center_x));
+      deviation.scan_y = static_cast<uint16_t>(std::max(0, result->y));
+      deviation.left = static_cast<int16_t>(result->left);
+      deviation.right = static_cast<int16_t>(result->right);
+      deviation.min_width =
+          static_cast<uint16_t>(std::max(0, result->min_width));
+      deviation.max_width =
+          static_cast<uint16_t>(std::max(0, result->max_width));
+      deviation.boundary_source =
+          result->used_barrier_gap ? "BARRIER_GAP" : "ROAD_MASK";
+    }
+
     pub_deviation_->publish(deviation);
-
-    
-    pub_source_->publish(*msg);
-    if (make_visualization_data) {
-      sensor_msgs::msg::Image ipm_message;
-      ipm_message.header = msg->header;
-      ipm_message.width = static_cast<uint32_t>(img.width);
-      ipm_message.height = static_cast<uint32_t>(img.height);
-      ipm_message.encoding = "mono8";
-      ipm_message.step = static_cast<uint32_t>(img.width);
-      ipm_message.data.assign(
-          ipm_mask.data,
-          ipm_mask.data + static_cast<size_t>(img.width) * img.height);
-
-      sensor_msgs::msg::Image processed_message = ipm_message;
-      processed_message.data = processed_mask;
-      pub_ipm_mask_->publish(ipm_message);
-      pub_processed_mask_->publish(processed_message);
-    }
-
-    std::free(seg_mask);                     // inference 内部分配，用完释放
-
-    // 5) 发布掩膜（移动，避免整帧拷贝）
-    pub_seg_->publish(std::move(*out));
-  }
-  void publish_invalid_boundary(const std_msgs::msg::Header & header)
-  {
-    scoutcar_msgs::msg::RoadDeviation boundary;
-    boundary.header = header;
-    boundary.valid = false;
-    pub_deviation_->publish(boundary);
   }
 
-  bool visualizer_connected() const
-  {
-    return pub_ipm_mask_->get_subscription_count() > 0 ||
-           pub_processed_mask_->get_subscription_count() > 0;
-  }
-
-  std::string model_path_;
-  std::string label_path_;
-  std::string usb_image_topic_;
-  std::string mipi_image_topic_;
-  bool model_ok_ = false;
-  bool post_process_ok_ = false;
-  rknn_app_context_t rknn_ctx_{};   // 模型上下文（yolov5_seg.h）
+  std::string seg_model_path_;
+  std::string seg_label_path_;
+  std::string detect_model_path_;
+  std::string detect_label_path_;
+  double detect_confidence_threshold_ = 0.25;
+  double detect_nms_threshold_ = 0.45;
+  std::string front_image_topic_;
+  std::string turn_image_topic_;
   std::unique_ptr<road_tracking::RoadTracker> road_tracker_;
-  cv::Mat mipi_ipm_matrix_;
-  cv::Mat usb_ipm_matrix_;
+  std::unique_ptr<scoutcar_perception::SegmentationModel> segmentation_model_;
+  scoutcar_perception::PerceptionVisualizer visualizer_;
+  cv::Mat front_ipm_matrix_;
+  cv::Mat turn_ipm_matrix_;
+  cv::Mat front_ipm_inverse_;
+  cv::Mat turn_ipm_inverse_;
+  std::unique_ptr<scoutcar_perception::YoloV8Model> detection_model_;
+  int front_reference_x_ = 320;
+  int turn_reference_x_ = 320;
   bool cam_turned_ = false;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_seg_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_source_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_ipm_mask_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_processed_mask_;
+  bool detect_status_ = false;
+
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_cam_status_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_usb_image_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_mipi_image_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_front_image_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_turn_image_;
+  rclcpp::Subscription<scoutcar_msgs::msg::DetectTask>::SharedPtr sub_detect_task_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_mask_debug_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_ipm_debug_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_front_detection_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_turn_detection_;
+  rclcpp::Publisher<scoutcar_msgs::msg::DetectTask>::SharedPtr pub_detect_results_;
   rclcpp::Publisher<scoutcar_msgs::msg::RoadDeviation>::SharedPtr pub_deviation_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_image_;
 };
 
-int main(int argc, char ** argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<PerceptionNode>());
   rclcpp::shutdown();

@@ -9,10 +9,12 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     config_file = LaunchConfiguration("config_file")
     log_level = LaunchConfiguration("log_level")
-    enable_visualizer = LaunchConfiguration("enable_visualizer")
-
+    web = LaunchConfiguration("web")
     default_config = PathJoinSubstitution(
         [FindPackageShare("scoutcar_bringup"), "config", "cityscout.yaml"]
+    )
+    web_config = PathJoinSubstitution(
+        [FindPackageShare("scoutcar_web"), "config", "web.yaml"]
     )
 
     common = {
@@ -34,35 +36,26 @@ def generate_launch_description():
                 description="ROS 日志级别",
             ),
             DeclareLaunchArgument(
-                "enable_visualizer",
-                default_value="true",
-                description="是否启动感知调试图绘制节点",
+                "web",
+                default_value="false",
+                description="true 启动绘制与 Web 转发；false 使用纯净感知",
             ),
             Node(
                 package="scoutcar_camera",
                 executable="camera_node",
-                name="mipi_camera_node",
+                name="front_camera_node",
                 **common,
             ),
             Node(
                 package="scoutcar_camera",
                 executable="camera_node",
-                name="usb_camera_node",
+                name="turn_camera_node",
                 **common,
             ),
             Node(
                 package="scoutcar_perception",
                 executable="perception_node",
                 name="perception_node",
-                parameters=[config_file],
-                output="screen",
-                arguments=["--ros-args", "--log-level", log_level],
-            ),
-            Node(
-                package="scoutcar_perception",
-                executable="visualizer_node",
-                name="visualizer_node",
-                condition=IfCondition(enable_visualizer),
                 parameters=[config_file],
                 output="screen",
                 arguments=["--ros-args", "--log-level", log_level],
@@ -80,5 +73,14 @@ def generate_launch_description():
             #     **common,
             # ),
             Node(package="scoutcar_control", executable="serial_node", name="serial_node", **common),
+            Node(
+                package="scoutcar_web",
+                executable="web_node",
+                name="web_node",
+                parameters=[web_config],
+                output="screen",
+                arguments=["--ros-args", "--log-level", log_level],
+                condition=IfCondition(web),
+            ),
         ]
     )

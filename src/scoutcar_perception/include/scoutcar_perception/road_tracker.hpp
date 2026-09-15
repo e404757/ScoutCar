@@ -15,14 +15,12 @@ struct Config {
 
 struct Result {
   bool valid = false;
-  int deviation = -999;
+  int deviation = 0;
   int y = 0;
   int left = -1;
   int right = -1;
-  int width = 0;
   int center_x = -1;
   bool used_barrier_gap = false;
-  float selected_pt = 0.0f;
   int min_width = 0;
   int max_width = 0;
 };

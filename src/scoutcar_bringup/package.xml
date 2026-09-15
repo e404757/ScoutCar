@@ -15,6 +15,7 @@
   <exec_depend>scoutcar_perception</exec_depend>
   <exec_depend>scoutcar_planning</exec_depend>
   <exec_depend>scoutcar_control</exec_depend>
+  <exec_depend>scoutcar_web</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

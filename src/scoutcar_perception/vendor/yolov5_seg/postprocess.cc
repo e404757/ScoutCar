@@ -369,7 +369,7 @@ void matmul_by_cpu_uint8(std::vector<float> &A, float *B, uint8_t *C, int ROWS_A
     }
 }
 
-void matmul_by_npu_fp(std::vector<float> &A_input, float *B_input, float *C_input, int ROWS_A, int COLS_A, int COLS_B, rknn_app_context_t *app_ctx)
+void matmul_by_npu_fp(std::vector<float> &A_input, float *B_input, float *C_input, int ROWS_A, int COLS_A, int COLS_B, seg_rknn_app_context_t *app_ctx)
 {
     int B_layout = 0;
     int AC_layout = 0;
@@ -479,7 +479,7 @@ static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale) { return (
 //INT8 量化版解析
 static int process_i8(rknn_output *all_input, int input_id, int *anchor, int grid_h, int grid_w, int height, int width, int stride,
                       std::vector<float> &boxes, std::vector<float> &segments, float *proto, std::vector<float> &objProbs, std::vector<int> &classId, float threshold,
-                      float *raw_class_score, rknn_app_context_t *app_ctx)
+                      float *raw_class_score, seg_rknn_app_context_t *app_ctx)
 {
 
     int validCount = 0;
@@ -674,7 +674,7 @@ static int process_fp32(rknn_output *all_input, int input_id, int *anchor, int g
     return validCount;
 }
 
-int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, object_detect_result_list *od_results)
+int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, seg_object_detect_result_list *od_results)
 {
     std::vector<float> filterBoxes;
     std::vector<float> objProbs;
@@ -695,7 +695,7 @@ int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t 
     // 未过滤(阈值前)的每类最高分，用于标定 BOX_THRESH
     float raw_class_score[OBJ_CLASS_NUM] = {0.f, 0.f};
 
-    memset(od_results, 0, sizeof(object_detect_result_list));
+    memset(od_results, 0, sizeof(seg_object_detect_result_list));
 
     // 1.解析模型输出
     for (int i = 0; i < 7; i++)
@@ -866,7 +866,7 @@ int post_process(rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t 
     return 0;
 }
 
-int init_post_process(const char *label_path)
+int seg_init_post_process(const char *label_path)
 {
     int ret = 0;
     ret = loadLabelName(label_path, labels);
@@ -878,7 +878,7 @@ int init_post_process(const char *label_path)
     return 0;
 }
 
-char *coco_cls_to_name(int cls_id)
+char *seg_cls_to_name(int cls_id)
 {
 
     if (cls_id >= OBJ_CLASS_NUM)
@@ -894,7 +894,7 @@ char *coco_cls_to_name(int cls_id)
     return "null";
 }
 
-void deinit_post_process()
+void seg_deinit_post_process()
 {
     for (int i = 0; i < OBJ_CLASS_NUM; i++)
     {

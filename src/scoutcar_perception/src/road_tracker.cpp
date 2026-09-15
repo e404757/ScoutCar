@@ -156,15 +156,17 @@ Result RoadTracker::process(const uint8_t * mask, int width, int height,
 
     if (tracked_snacks.size() == required_valid_rows) {
       long long deviation_sum = 0;
-      long long length_sum = 0;
       int min_road_x=width-1;
       int max_road_x=0;
+      int min_road_width = width;
+      int max_road_width = 0;
       bool any_used_barrier_gap = false;
       for (const TrackedSnack & tracked : tracked_snacks) {
         const int snack_center =
             (tracked.snack.start_x + tracked.snack.end_x) / 2;
         deviation_sum += snack_center - reference_center;
-        length_sum += tracked.snack.length;
+        min_road_width = std::min(min_road_width, tracked.snack.length);
+        max_road_width = std::max(max_road_width, tracked.snack.length);
         min_road_x = std::min(min_road_x, tracked.snack.start_x);
         max_road_x = std::max(max_road_x, tracked.snack.end_x);
         any_used_barrier_gap =
@@ -187,7 +189,8 @@ Result RoadTracker::process(const uint8_t * mask, int width, int height,
       result.y = tracked_snacks[tracked_snacks.size() / 2].y;
       result.left = min_road_x;
       result.right = max_road_x;
-      result.width = static_cast<int>(length_sum / required_valid_rows);
+      result.min_width = min_road_width;
+      result.max_width = max_road_width;
       result.used_barrier_gap = any_used_barrier_gap;
       break;
     }

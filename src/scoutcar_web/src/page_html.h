@@ -20,6 +20,13 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
               cursor:pointer; color:#fff; }
     .recbtn.idle { background:#2a7; }
     .recbtn.rec { background:#d33; }
+    .obstacle-btn { padding:10px 20px; font-size:15px; border:1px solid #c55;
+                    border-radius:8px; cursor:pointer; color:#fff; background:#922; }
+    .obstacle-btn:disabled { opacity:.45; cursor:not-allowed; }
+    .detect-btn { padding:10px 20px; font-size:15px; border:1px solid #3a8;
+                  border-radius:8px; cursor:pointer; color:#fff; background:#176b4b; }
+    .detect-btn.active { border-color:#c55; background:#922; }
+    .detect-btn:disabled { opacity:.45; cursor:not-allowed; }
     .dot { display:inline-block; width:12px; height:12px; border-radius:50%;
            background:#333; vertical-align:middle; margin-right:6px; }
     .dot.on { background:#f44; animation: blink 1s infinite; }
@@ -51,9 +58,19 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
       <select id="view-select" onchange="switchView(this.value)">
         <option value="perception">普通感知（自动相机）</option>
         <option value="ipm">逆透视</option>
-        <option value="usb_raw">USB 原图</option>
-        <option value="mipi_raw">MIPI 原图</option>
+        <option value="front_raw">正前方原图</option>
+        <option value="turn_raw">转向原图</option>
+        <option value="front_detection">正前方 Detect</option>
+        <option value="turn_detection">转向 Detect</option>
       </select>
+    </div>
+    <div class="status">
+      <button class="obstacle-btn" id="obstacle-btn" onclick="triggerObstacle()">模拟遇到障碍</button>
+      <span id="obstacle-text"></span>
+    </div>
+    <div class="status">
+      <button class="detect-btn" id="detect-btn" onclick="triggerDetect()">开始侦察</button>
+      <span id="detect-text"></span>
     </div>
   </div>
   <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
@@ -70,7 +87,7 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
 
 <script>
 // ══════════ 实时页 ══════════
-let recState = { recording: false, bag_recording: false };
+let recState = { recording: false, bag_recording: false, detecting: false };
 
 async function refreshStatus() {
   try {
@@ -91,8 +108,13 @@ async function refreshStatus() {
   } else {
     txt.textContent = '录像未开始';
   }
+  const detectBtn = document.getElementById('detect-btn');
+  detectBtn.disabled = false;
+  detectBtn.className = recState.detecting ? 'detect-btn active' : 'detect-btn';
+  detectBtn.textContent = recState.detecting ? '停止侦察' : '开始侦察';
   const viewSelect = document.getElementById('view-select');
-  if (viewSelect && ['perception','ipm','usb_raw','mipi_raw'].includes(recState.view_mode)) {
+  if (viewSelect && ['perception','ipm','front_raw','turn_raw',
+                     'front_detection','turn_detection'].includes(recState.view_mode)) {
     viewSelect.value = recState.view_mode;
   }
   renderInfoPanel();
@@ -111,11 +133,20 @@ async function switchView(mode) {
 // 侧边参数面板：显示当前跟踪算法使用的阈值和扫描行。
 function renderInfoPanel() {
   const b = recState.boundary || {};
+  const statusText = ({0:'正常', 1:'无分割结果', 2:'道路跟踪失败',
+                       3:'推理错误'})[b.status] ?? '未知状态';
   const html = !b.online
     ? '<span style="color:#766">离线 / 无数据</span>'
-    : '扫描行　<b>y = ' + (b.scan_y ?? '—') + ' px</b>' +
+    : '状态　<b>' + statusText + '</b>' +
+      '\n偏差　<b>' + (b.deviation ?? '—') + ' px</b>' +
+      '\n路面中心　<b>x = ' + (b.road_center ?? '—') + ' px</b>' +
+      '\n左右边界　<b>' + (b.left ?? '—') + ' / ' + (b.right ?? '—') + ' px</b>' +
+      '\n边界来源　<b>' + (b.boundary_source || '—') + '</b>' +
+      '\n扫描行　<b>y = ' + (b.scan_y ?? '—') + ' px</b>' +
       '\n道路宽度阈值　<b>' + (b.min_width ?? '—') +
-      ' ~ ' + (b.max_width ?? '—') + ' px</b>';
+      ' ~ ' + (b.max_width ?? '—') + ' px</b>' +
+      '\n前视参考 x　<b>' + (b.front_reference_x ?? '—') + ' px</b>' +
+      '\n转向参考 x　<b>' + (b.turn_reference_x ?? '—') + ' px</b>';
   document.getElementById('mi-boundary').innerHTML = html;
 }
 
@@ -126,6 +157,44 @@ async function toggleRecord() {
     if (!on) { await sleep(200); }   // 等片段创建
     await refreshStatus();
   } catch (e) {}
+}
+
+async function triggerObstacle() {
+  const btn = document.getElementById('obstacle-btn');
+  const text = document.getElementById('obstacle-text');
+  btn.disabled = true;
+  text.textContent = '发送中…';
+  try {
+    const response = await fetch('/api/obstacle', { method: 'POST' });
+    if (!response.ok) throw new Error('发送失败');
+    text.textContent = '已发送';
+  } catch (e) {
+    text.textContent = '发送失败';
+  }
+  setTimeout(() => {
+    btn.disabled = false;
+    text.textContent = '';
+  }, 1000);
+}
+
+async function triggerDetect() {
+  const btn = document.getElementById('detect-btn');
+  const text = document.getElementById('detect-text');
+  btn.disabled = true;
+  text.textContent = '发送中…';
+  try {
+    const response = await fetch('/api/detect/toggle', { method: 'POST' });
+    if (!response.ok) throw new Error('发送失败');
+    recState = await response.json();
+    text.textContent = recState.detecting ? '侦察已开始' : '侦察已停止';
+    await refreshStatus();
+  } catch (e) {
+    text.textContent = '发送失败';
+  }
+  setTimeout(() => {
+    btn.disabled = false;
+    text.textContent = '';
+  }, 1000);
 }
 
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }

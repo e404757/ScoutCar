@@ -8,6 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <scoutcar_msgs/msg/mission_status.hpp>
 #include <scoutcar_msgs/msg/path_cmd.hpp>
 #include <scoutcar_msgs/msg/rx_event.hpp>
@@ -67,6 +68,9 @@ public:
           on_recon_found();
         }
       });
+    sub_obstacle_ = create_subscription<std_msgs::msg::Empty>(
+      "obstacle/event", 10,
+      [this](const std_msgs::msg::Empty::SharedPtr) { do_obstacle(); });
     publish_status();
   }
 
@@ -109,6 +113,7 @@ private:
     random_remain_ = recon_target;
     waiting_uturn_finished_ = false;
     waiting_turn_finished_ = false;
+    returning_to_previous_node_ = false;
     mission_started_ = true;
     mission_done_ = false;
     publish_status();
@@ -131,14 +136,31 @@ private:
     if (!mission_started_ || mission_done_) {
       return;
     }
-    const TurnAction acting = seg_index_ < segments_.size()
-      ? segments_[seg_index_].action : TurnAction::STOP;
+    const TurnAction acting = returning_to_previous_node_
+      ? obstacle_return_action_
+      : (seg_index_ < segments_.size()
+          ? segments_[seg_index_].action : TurnAction::STOP);
     if (acting == TurnAction::LEFT || acting == TurnAction::RIGHT || acting == TurnAction::UTURN)
     {
       set_deviation(false);
     }
     if (waiting_uturn_finished_) {
       RCLCPP_DEBUG(get_logger(), "掉头尚未完成，忽略到达通知");
+      return;
+    }
+    // 障碍后的第一次到达，是沿原路返回上一节点。此时返回段携带的 action
+    // 已经开始执行，再下发重规划路线的第一段，供转向完成后继续行驶。
+    if (returning_to_previous_node_) {
+      current_node_ = obstacle_previous_node_;
+      returning_to_previous_node_ = false;
+      send_segment(0);
+      pending_from_ = segments_[0].node;
+      pending_arrival_ = segments_[0].next;
+      first_segment_sent_ = true;
+      seg_index_ = 1;
+      publish_status();
+      RCLCPP_INFO(get_logger(), "已返回节点 %d，发送重规划后的第一段",
+                  current_node_);
       return;
     }
     if (!first_segment_sent_) {
@@ -206,10 +228,11 @@ private:
         RCLCPP_WARN(get_logger(), "掉头结束，但重规划路径为空");
         return;
       }
-      send_segment(0);
-      pending_from_ = segments_[0].node;
-      pending_arrival_ = segments_[0].next;
-      first_segment_sent_ = true;
+      send_obstacle_return_segment();
+      pending_from_ = obstacle_blocked_goal_;
+      pending_arrival_ = obstacle_previous_node_;
+      returning_to_previous_node_ = true;
+      first_segment_sent_ = false;
       waiting_uturn_finished_= false;
       seg_index_ = 1;
     }
@@ -217,18 +240,46 @@ private:
     RCLCPP_INFO(get_logger(), "转向完成，恢复循迹偏差发送");
   }
 
-  // 0xCC：障碍 → 阻断当前边 + 重规划 + 发掉头（原 obstacle_requested 分支）
+  // 障碍事件：阻断当前边 + 重规划 + 发掉头。
+  // 真实检测节点和 Web 模拟按钮都只需发布 /obstacle/event。
   void do_obstacle()
   {
-    set_deviation(false);
-    if (pending_from_ > 0 && pending_arrival_ > 0) {
-      graph_.setBlocked(pending_from_, pending_arrival_, true);
-      blocked_edges_.insert({pending_from_, pending_arrival_});
-      RCLCPP_INFO(get_logger(), "阻断边 %d→%d（单向，反向仍可走）", pending_from_, pending_arrival_);
+    if (!mission_started_ || mission_done_) {
+      RCLCPP_WARN(get_logger(), "当前没有执行中的任务，忽略障碍事件");
+      return;
     }
+    if (waiting_uturn_finished_) {
+      RCLCPP_WARN(get_logger(), "正在等待障碍掉头完成，忽略重复障碍事件");
+      return;
+    }
+    if (returning_to_previous_node_) {
+      RCLCPP_WARN(get_logger(), "正在返回障碍前的节点，忽略重复障碍事件");
+      return;
+    }
+    if (pending_from_ <= 0 || pending_arrival_ <= 0) {
+      RCLCPP_WARN(get_logger(), "当前没有正在行驶的有效路径段，忽略障碍事件");
+      return;
+    }
+
+    obstacle_previous_node_ = pending_from_;
+    obstacle_blocked_goal_ = pending_arrival_;
+    set_deviation(false);
+    graph_.setBlocked(pending_from_, pending_arrival_, true);
+    blocked_edges_.insert({pending_from_, pending_arrival_});
+    RCLCPP_INFO(get_logger(), "阻断边 %d→%d（单向，反向仍可走）", pending_from_, pending_arrival_);
     if (replan_from_current() != 0) {
       RCLCPP_WARN(get_logger(), "障碍重规划失败");
       return;
+    }
+    // 掉头后沿 B→A 返回。到达 A 时的动作必须根据来向 B→A 和新路线
+    // 首边 A→C 计算，不能使用规划器默认的“起点朝向首边”。
+    obstacle_return_action_ = TurnAction::STOP;
+    if (!segments_.empty() && segments_[0].next > 0) {
+      const Heading incoming =
+        edgeHeading(obstacle_blocked_goal_, obstacle_previous_node_);
+      const Heading outgoing =
+        edgeHeading(obstacle_previous_node_, segments_[0].next);
+      obstacle_return_action_ = turnAction(incoming, outgoing);
     }
     scoutcar_msgs::msg::PathCmd ut;
     ut.start = static_cast<uint8_t>(current_node_);
@@ -242,6 +293,18 @@ private:
     first_segment_sent_ = false;
     seg_index_ = 1;
     RCLCPP_INFO(get_logger(), "障碍，已发送掉头");
+  }
+
+  void send_obstacle_return_segment()
+  {
+    scoutcar_msgs::msg::PathCmd cmd;
+    cmd.start = static_cast<uint8_t>(obstacle_blocked_goal_);
+    cmd.goal = static_cast<uint8_t>(obstacle_previous_node_);
+    cmd.action = static_cast<uint8_t>(obstacle_return_action_);
+    pub_path_->publish(cmd);
+    RCLCPP_INFO(get_logger(),
+                "[任务] 障碍返回段 %u→%u，到达后动作[%s]",
+                cmd.start, cmd.goal, actionName(obstacle_return_action_));
   }
 
   // ═══════════════ 规划 ═══════════════
@@ -374,12 +437,16 @@ private:
   bool first_segment_sent_ = false;
   bool waiting_uturn_finished_ = false;
   bool waiting_turn_finished_ = false;
+  bool returning_to_previous_node_ = false;
 
   std::vector<StepCommand> segments_;
   size_t seg_index_ = 1;
   int current_node_ = 1;
   int pending_from_ = -1;
   int pending_arrival_ = -1;
+  int obstacle_previous_node_ = -1;
+  int obstacle_blocked_goal_ = -1;
+  TurnAction obstacle_return_action_ = TurnAction::STRAIGHT;
 
   int fixed_remain_ = static_cast<int>(kFixedPoints.size());//固定点剩余数量
   int random_remain_ = recon_target;//侦察点剩余数量
@@ -404,6 +471,7 @@ private:
 
   rclcpp::Subscription<scoutcar_msgs::msg::RxEvent>::SharedPtr sub_event_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_recon_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_obstacle_;
 
 };
 

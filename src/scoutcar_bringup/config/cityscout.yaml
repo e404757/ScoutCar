@@ -1,41 +1,40 @@
-mipi_camera_node:
+front_camera_node:
   ros__parameters:
-    camera_path: "/dev/video11"
+    camera_path: "/dev/video31"
     fps: 30
     image_width: 640
     image_height: 480
-    image_topic: "/camera/mipi/image_raw"
+    image_topic: "/camera/front/image_raw"
     prefer_mipi: true
 
-usb_camera_node:
+turn_camera_node:
   ros__parameters:
-    camera_path: "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
+    camera_path: "/dev/video22"
     fps: 30
     image_width: 640
     image_height: 480
-    image_topic: "/camera/usb/image_raw"
-    prefer_mipi: false
+    image_topic: "/camera/turn/image_raw"
+    prefer_mipi: true
 
 perception_node:
   ros__parameters:
-    usb_image_topic: "/camera/usb/image_raw"
-    mipi_image_topic: "/camera/mipi/image_raw"
-    ipm.mipi_source_points: [219.0, 190.0, 412.0, 190.0, 65.0, 440.0, 559.0, 440.0]
-    ipm.usb_source_points: [255.0, 240.0, 489.0, 240.0, 207.0, 440.0, 627.0, 440.0]
-    ipm.destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
-    # 以下宽度和偏差都在 640x480 俯视图中，近处和远处使用同一尺度。
+    ipm.front_source_points: [232.0, 190.0, 431.0, 190.0, 95.0, 420.0, 588.0, 420.0]
+    ipm.turn_source_points: [260.0, 190.0, 400.0, 190.0, 145.0, 420.0, 520.0, 420.0]
+    ipm.front_destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
+    ipm.turn_destination_points: [170.0, 120.0, 470.0, 120.0, 170.0, 470.0, 470.0, 470.0]
+
     road_tracking.scan_end_y: 120
     road_tracking.min_road_width_px: 225
     road_tracking.max_road_width_px: 285
     road_tracking.min_barrier_width_px: 12
     road_tracking.search_expand_px: 20
     road_tracking.min_valid_rows: 60
+    road_tracking.front_reference_x: 312
+    road_tracking.turn_reference_x: 320
 
-visualizer_node:
-  ros__parameters:
-    ipm.mipi_source_points: [219.0, 190.0, 412.0, 190.0, 65.0, 440.0, 559.0, 440.0]
-    ipm.usb_source_points: [255.0, 240.0, 489.0, 240.0, 207.0, 440.0, 627.0, 440.0]
-    ipm.destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
+    detect.confidence_threshold: 0.25
+    detect.nms_threshold: 0.45
+
 
 mission_node:
   ros__parameters:
