@@ -9,8 +9,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/RxEvent.msg"
   "msg/PathCmd.msg"
   "msg/MissionStatus.msg"
+  "msg/CarState.msg"
   "msg/RoadDeviation.msg"
   "msg/DetectTask.msg"
+  "msg/BtpDebug.msg"
   DEPENDENCIES std_msgs
 )
 

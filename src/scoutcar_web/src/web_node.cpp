@@ -13,19 +13,25 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <scoutcar_msgs/msg/car_state.hpp>
+#include <scoutcar_msgs/msg/btp_debug.hpp>
 #include <scoutcar_msgs/msg/detect_task.hpp>
 #include <scoutcar_msgs/msg/road_deviation.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 
 #include <opencv2/opencv.hpp>
 
 #include "bag_recorder.h"
 #include "dual_recorder.h"
 #include "httplib.h"
+#include "video_writer.h"
 
 #include "page_html.h"
 
+using scoutcar_msgs::msg::CarState;
+using scoutcar_msgs::msg::BtpDebug;
 using scoutcar_msgs::msg::RoadDeviation;
 using sensor_msgs::msg::Image;
 
@@ -36,6 +42,12 @@ enum class ViewMode {
   TURN_RAW,
   FRONT_DETECTION,
   TURN_DETECTION
+};
+
+struct SourceFrame {
+  builtin_interfaces::msg::Time stamp;
+  Image::SharedPtr image;
+  scoutcar_web::CameraSource camera = scoutcar_web::CameraSource::FRONT;
 };
 
 class WebNode : public rclcpp::Node {
@@ -51,9 +63,11 @@ public:
         "bag_dir", "/home/orangepi/CityScout/data/bags");
     bag_topics_ = declare_parameter<std::vector<std::string>>(
         "bag_topics",
-        {"/perception/seg_mask", "/perception/road_boundary",
-         "/mission/deviation_enable", "/mission/path_cmd",
-         "/mission/detect_task", "/mcu/rx_event"});
+        {"/perception/road_deviation", "/perception/is_btp",
+         "/mission/mission_state", "/mission/base_cmd",
+         "/mission/path_cmd", "/mission/detect_task",
+         "/perception/detect_results", "/mcu/rx_event",
+         "/obstacle/event"});
     jpg_quality_ = declare_parameter<int>("jpg_quality", 85);
 
     sub_front_image_ = create_subscription<Image>(
@@ -80,19 +94,27 @@ public:
         });
     // 数值面板数据
     sub_boundary_ = create_subscription<RoadDeviation>(
-        "/perception/road_boundary", 10,
+        "/perception/road_deviation", 10,
         [this](const RoadDeviation::SharedPtr msg) { onBoundary(msg); });
+    sub_btp_debug_ = create_subscription<BtpDebug>(
+        "/perception/btp_debug", 10,
+        [this](const BtpDebug::SharedPtr msg) { onBtpDebug(msg); });
     pub_obstacle_ =
         create_publisher<std_msgs::msg::Empty>("/obstacle/event", 10);
     const auto detect_qos =
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    sub_mission_state_ = create_subscription<CarState>(
+        "/mission/mission_state", detect_qos,
+        [this](const CarState::SharedPtr msg) { onMissionState(msg); });
     pub_detect_task_ = create_publisher<scoutcar_msgs::msg::DetectTask>(
         "/mission/detect_task", detect_qos);
+    pub_btp_debug_cmd_ = create_publisher<std_msgs::msg::UInt8>(
+        "/debug/btp_camera_pose", detect_qos);
 
     control_timer_ = create_wall_timer(std::chrono::milliseconds(100),
                                        [this]() { pollRecordRequests(); });
 
-    recorder_.configure(record_dir_, record_fps_);
+    recorder_.configure(record_dir_, bag_dir_, record_fps_);
     bag_recorder_.configure(bag_dir_, bag_topics_);
 
     startHttpServer(port_);
@@ -130,7 +152,7 @@ private:
   }
 
   void onFrontCamera(const Image::SharedPtr msg) {
-    onSource(msg);
+    onSource(msg, scoutcar_web::CameraSource::FRONT);
     if (view_mode_.load() != ViewMode::FRONT_RAW) {
       return;
     }
@@ -151,7 +173,7 @@ private:
     encodeLive(bgr);
   }
   void onTurnCamera(const Image::SharedPtr msg) {
-    onSource(msg);
+    onSource(msg, scoutcar_web::CameraSource::TURN);
     if (view_mode_.load() != ViewMode::TURN_RAW) {
       return;
     }
@@ -182,11 +204,28 @@ private:
     }
     // 叠加录像：原始帧按时间戳从 source 队列取回（同帧配对），帧号天然对齐
     if (recorder_.active()) {
-      Image::SharedPtr source = matchSource(msg->header.stamp);
-      if (source != nullptr &&
-          source->data.size() >= static_cast<size_t>(width) * height * 3) {
-        recorder_.write_frame(source->data.data(), msg->data.data(), width,
-                              height);
+      const auto source = matchSource(msg->header.stamp);
+      if (source && source->image != nullptr &&
+          source->image->data.size() >=
+              static_cast<size_t>(width) * height * 3) {
+        scoutcar_web::FrameMetadata metadata;
+        metadata.image_stamp_ns = rclcpp::Time(source->stamp).nanoseconds();
+        metadata.camera = source->camera;
+        const auto state = missionStateFor(source->stamp);
+        if (state) {
+          metadata.has_mission_state = true;
+          metadata.state_stamp_ns = rclcpp::Time(state->header.stamp).nanoseconds();
+          metadata.mission_revision = state->revision;
+          metadata.mission_state = state->mission_state;
+          metadata.segment_start = state->segment_start;
+          metadata.segment_goal = state->segment_goal;
+          metadata.segment_index = state->segment_index;
+          metadata.arrival_action = state->arrival_action;
+          metadata.front_camera_pose = state->front_camera_pose;
+          metadata.turn_camera_pose = state->turn_camera_pose;
+        }
+        recorder_.write_frame(source->image->data.data(), msg->data.data(),
+                              width, height, metadata);
       }
     }
     if (view_mode_.load() != ViewMode::PERCEPTION) {
@@ -267,28 +306,60 @@ private:
     }
   }
 
-  void onSource(const Image::SharedPtr msg) {
+  void onSource(const Image::SharedPtr msg,
+                scoutcar_web::CameraSource camera) {
     std::lock_guard<std::mutex> lock(source_mutex_);
-    source_queue_.emplace_back(msg->header.stamp, msg);
+    source_queue_.push_back(SourceFrame{msg->header.stamp, msg, camera});
     while (source_queue_.size() > 20) {
       source_queue_.pop_front();
     }
   }
 
-  Image::SharedPtr matchSource(const builtin_interfaces::msg::Time &stamp) {
+  std::optional<SourceFrame> matchSource(
+      const builtin_interfaces::msg::Time &stamp) {
     std::lock_guard<std::mutex> lock(source_mutex_);
     for (auto it = source_queue_.rbegin(); it != source_queue_.rend(); ++it) {
-      if (rclcpp::Time(it->first) == rclcpp::Time(stamp)) {
-        return it->second;
+      if (rclcpp::Time(it->stamp) == rclcpp::Time(stamp)) {
+        return *it;
       }
     }
-    return nullptr;
+    return std::nullopt;
+  }
+
+  std::optional<CarState> missionStateFor(
+      const builtin_interfaces::msg::Time &stamp) {
+    const int64_t image_stamp_ns = rclcpp::Time(stamp).nanoseconds();
+    std::lock_guard<std::mutex> lock(mission_state_mutex_);
+    for (auto it = mission_state_history_.rbegin();
+         it != mission_state_history_.rend(); ++it) {
+      const int64_t state_stamp_ns = rclcpp::Time(it->header.stamp).nanoseconds();
+      if (state_stamp_ns == 0 || state_stamp_ns <= image_stamp_ns) {
+        return *it;
+      }
+    }
+    return std::nullopt;
   }
 
   void onBoundary(const RoadDeviation::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(boundary_mutex_);
     latest_boundary_ = *msg;
     boundary_time_ = std::chrono::steady_clock::now();
+  }
+
+  void onBtpDebug(const BtpDebug::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(btp_debug_mutex_);
+    latest_btp_debug_ = *msg;
+    btp_debug_time_ = std::chrono::steady_clock::now();
+  }
+
+  void onMissionState(const CarState::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(mission_state_mutex_);
+    latest_mission_state_ = *msg;
+    mission_state_history_.push_back(*msg);
+    while (mission_state_history_.size() > 64) {
+      mission_state_history_.pop_front();
+    }
+    mission_state_time_ = std::chrono::steady_clock::now();
   }
 
   // ═══════════════ 录像控制 ═══════════════
@@ -492,9 +563,56 @@ private:
                              active ? "开始" : "结束");
                  res.set_content(statusJson(), "application/json");
                });
+
+    svr_->Post("/api/btp-debug/set",
+               [this](const httplib::Request &req, httplib::Response &res) {
+                 const std::string pose = req.get_param_value("pose");
+                 uint8_t value = 0;
+                 if (pose == "left") {
+                   value = CarState::DIRECTION_LEFT;
+                 } else if (pose == "right") {
+                   value = CarState::DIRECTION_RIGHT;
+                 } else if (pose != "off") {
+                   res.status = 400;
+                   res.set_content(
+                       "{\"ok\":false,\"reason\":\"unknown pose\"}",
+                       "application/json");
+                   return;
+                 }
+
+                 std_msgs::msg::UInt8 command;
+                 command.data = value;
+                 pub_btp_debug_cmd_->publish(command);
+                 btp_debug_pose_.store(value);
+                 RCLCPP_INFO(get_logger(), "Web BTP 调试姿态=%s", pose.c_str());
+                 res.set_content(statusJson(), "application/json");
+               });
   }
 
   // ═══════════════ JSON ═══════════════
+
+  static const char *missionStateName(uint8_t state) {
+    switch (state) {
+    case CarState::WAIT_START: return "等待启动";
+    case CarState::DRIVING: return "行驶";
+    case CarState::FINDING_BTP: return "寻找转向点";
+    case CarState::TURNING: return "转向";
+    case CarState::DETECTING: return "侦察";
+    case CarState::FINISHED: return "结束/不可执行";
+    default: return "未知";
+    }
+  }
+
+  static const char *directionName(uint8_t direction) {
+    switch (direction) {
+    case CarState::DIRECTION_NONE: return "停止";
+    case CarState::DIRECTION_AHEAD: return "直行/朝前";
+    case CarState::DIRECTION_LEFT: return "左";
+    case CarState::DIRECTION_RIGHT: return "右";
+    case CarState::DIRECTION_UTURN: return "掉头";
+    default: return "未知";
+    }
+  }
 
   std::string statusJson() {
     const auto now = std::chrono::steady_clock::now();
@@ -537,16 +655,83 @@ private:
       boundary_json = buf;
     }
 
-    char buf[1024];
+    std::string mission_json;
+    {
+      std::lock_guard<std::mutex> lock(mission_state_mutex_);
+      const long long ms = ageMs(mission_state_time_);
+      const CarState *state =
+          latest_mission_state_ ? &*latest_mission_state_ : nullptr;
+      const bool online = state != nullptr;
+      char state_buf[1536];
+      snprintf(
+          state_buf, sizeof(state_buf),
+          "{\"online\":%s,\"age_ms\":%lld,\"revision\":%u,"
+          "\"system_status\":%u,\"mission_state\":%u,"
+          "\"mission_state_name\":\"%s\","
+          "\"fixed_remaining\":%u,\"random_remaining\":%u,"
+          "\"segment_start\":%d,"
+          "\"segment_goal\":%d,\"segment_index\":%d,"
+          "\"arrival_action\":%u,\"arrival_action_name\":\"%s\","
+          "\"front_camera_pose\":%u,\"front_camera_pose_name\":\"%s\","
+          "\"turn_camera_pose\":%u,\"turn_camera_pose_name\":\"%s\"}",
+          online ? "true" : "false", ms,
+          state ? state->revision : 0U,
+          state ? static_cast<unsigned>(state->system_status) : 0U,
+          state ? static_cast<unsigned>(state->mission_state) : 0U,
+          state ? missionStateName(state->mission_state) : "无数据",
+          state ? static_cast<unsigned>(state->fixed_remaining) : 0U,
+          state ? static_cast<unsigned>(state->random_remaining) : 0U,
+          state ? state->segment_start : -1,
+          state ? state->segment_goal : -1,
+          state ? state->segment_index : -1,
+          state ? static_cast<unsigned>(state->arrival_action) : 0U,
+          state ? directionName(state->arrival_action) : "无数据",
+          state ? static_cast<unsigned>(state->front_camera_pose) : 0U,
+          state ? directionName(state->front_camera_pose) : "无数据",
+          state ? static_cast<unsigned>(state->turn_camera_pose) : 0U,
+          state ? directionName(state->turn_camera_pose) : "无数据");
+      mission_json = state_buf;
+    }
+
+    std::string btp_debug_json;
+    {
+      std::lock_guard<std::mutex> lock(btp_debug_mutex_);
+      const long long ms = ageMs(btp_debug_time_);
+      const BtpDebug *debug =
+          latest_btp_debug_ ? &*latest_btp_debug_ : nullptr;
+      char debug_buf[512];
+      snprintf(
+          debug_buf, sizeof(debug_buf),
+          "{\"active\":%s,\"pose\":%u,\"online\":%s,"
+          "\"status\":%u,\"deviation\":%d,\"reference_x\":%d,"
+          "\"min_deviation\":%d,\"max_deviation\":%d,"
+          "\"consecutive_frames\":%u,\"required_frames\":%u,"
+          "\"condition_met\":%s}",
+          btp_debug_pose_.load() != 0 ? "true" : "false",
+          static_cast<unsigned>(btp_debug_pose_.load()),
+          debug != nullptr && ms >= 0 && ms <= 1500 ? "true" : "false",
+          debug ? static_cast<unsigned>(debug->status) : 0U,
+          debug ? static_cast<int>(debug->deviation) : 0,
+          debug ? debug->reference_x : 0,
+          debug ? static_cast<int>(debug->min_deviation) : 0,
+          debug ? static_cast<int>(debug->max_deviation) : 0,
+          debug ? static_cast<unsigned>(debug->consecutive_frames) : 0U,
+          debug ? static_cast<unsigned>(debug->required_frames) : 0U,
+          debug && debug->condition_met ? "true" : "false");
+      btp_debug_json = debug_buf;
+    }
+
+    char buf[4096];
     snprintf(buf, sizeof(buf),
              "{\"ok\":true,\"recording\":%s,\"bag_recording\":%s,"
              "\"detecting\":%s,"
              "\"view_mode\":\"%s\","
-             "\"boundary\":%s}",
+             "\"boundary\":%s,\"mission\":%s,\"btp_debug\":%s}",
              recorder_.active() ? "true" : "false",
              bag_recorder_.active() ? "true" : "false",
              detect_active_.load() ? "true" : "false",
-             viewModeName(view_mode_.load()), boundary_json.c_str());
+             viewModeName(view_mode_.load()), boundary_json.c_str(),
+             mission_json.c_str(), btp_debug_json.c_str());
     return std::string(buf);
   }
 
@@ -563,27 +748,39 @@ private:
   // 话题
   std::atomic<ViewMode> view_mode_{ViewMode::PERCEPTION};
   std::atomic<bool> detect_active_{false};
+  std::atomic<uint8_t> btp_debug_pose_{0};
   std::mutex detect_command_mutex_;
   rclcpp::Subscription<Image>::SharedPtr sub_front_image_;
   rclcpp::Subscription<Image>::SharedPtr sub_turn_image_;
   rclcpp::Subscription<Image>::SharedPtr sub_debug_;
   rclcpp::Subscription<Image>::SharedPtr sub_ipm_debug_;
   rclcpp::Subscription<RoadDeviation>::SharedPtr sub_boundary_;
+  rclcpp::Subscription<BtpDebug>::SharedPtr sub_btp_debug_;
+  rclcpp::Subscription<CarState>::SharedPtr sub_mission_state_;
   rclcpp::Subscription<Image>::SharedPtr sub_front_detection_;
   rclcpp::Subscription<Image>::SharedPtr sub_turn_detection_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr pub_obstacle_;
   rclcpp::Publisher<scoutcar_msgs::msg::DetectTask>::SharedPtr pub_detect_task_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr pub_btp_debug_cmd_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 
   // 两路相机原图按时间戳缓存，用于和 debug_image 精确配对录像。
   std::mutex source_mutex_;
-  std::deque<std::pair<builtin_interfaces::msg::Time, Image::SharedPtr>>
-      source_queue_;
+  std::deque<SourceFrame> source_queue_;
 
   // 参数面板数据
   std::mutex boundary_mutex_;
   std::optional<RoadDeviation> latest_boundary_;
   std::chrono::steady_clock::time_point boundary_time_{};
+
+  std::mutex btp_debug_mutex_;
+  std::optional<BtpDebug> latest_btp_debug_;
+  std::chrono::steady_clock::time_point btp_debug_time_{};
+
+  std::mutex mission_state_mutex_;
+  std::optional<CarState> latest_mission_state_;
+  std::deque<CarState> mission_state_history_;
+  std::chrono::steady_clock::time_point mission_state_time_{};
 
   // 推流
   std::mutex live_mutex_;

@@ -157,6 +157,13 @@ void uart_send_detect_task(int fd,pathplan::DetectStatus st,uint8_t left_result,
     size_t len = pathplan::packDetectTask(buf,st,left_result,right_result);
     uart_send_frame(fd, buf, len);
 }
+
+void uart_send_base_control(int fd, const pathplan::BaseCmdFrame& command)
+{
+    uint8_t buf[pathplan::kMaxFrameLen];
+    size_t len = pathplan::packBaseControl(buf, command);
+    uart_send_frame(fd, buf, len);
+}
 // ═══════════════ 接收线程 ═══════════════
 
 // 解析下位机帧: FF 01 00 [flag] 00 DD
@@ -195,10 +202,9 @@ static void rx_loop()
                         break;
                     case READ_FLAG:
                         if (byte == (int)pathplan::RxFlag::START ||
+                            byte == (int)pathplan::RxFlag::STOP ||
                             byte == (int)pathplan::RxFlag::ARRIVED ||
-                            byte == (int)pathplan::RxFlag::TURN_FINISHED ||
-                            byte == (int)pathplan::RxFlag::CAM_AHEAD ||
-                            byte == (int)pathplan::RxFlag::CAM_TURNED ) {
+                            byte == (int)pathplan::RxFlag::TURN_FINISHED) {
                             pending_flag = static_cast<pathplan::RxFlag>(byte);
                             state = WAIT_00_2;
                         } else {

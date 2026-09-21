@@ -27,6 +27,9 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
                   border-radius:8px; cursor:pointer; color:#fff; background:#176b4b; }
     .detect-btn.active { border-color:#c55; background:#922; }
     .detect-btn:disabled { opacity:.45; cursor:not-allowed; }
+    .btp-btn { padding:9px 14px; font-size:14px; border:1px solid #587;
+               border-radius:8px; cursor:pointer; color:#fff; background:#245; }
+    .btp-btn.active { border-color:#4db; background:#176b5f; }
     .dot { display:inline-block; width:12px; height:12px; border-radius:50%;
            background:#333; vertical-align:middle; margin-right:6px; }
     .dot.on { background:#f44; animation: blink 1s infinite; }
@@ -72,13 +75,28 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
       <button class="detect-btn" id="detect-btn" onclick="triggerDetect()">开始侦察</button>
       <span id="detect-text"></span>
     </div>
+    <div class="status">
+      <span style="color:#aaa">BTP 调试：</span>
+      <button class="btp-btn" id="btp-left" onclick="setBtpDebug('left')">左侧</button>
+      <button class="btp-btn" id="btp-right" onclick="setBtpDebug('right')">右侧</button>
+      <button class="btp-btn" id="btp-off" onclick="setBtpDebug('off')">退出并复位</button>
+      <span id="btp-text"></span>
+    </div>
   </div>
   <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start">
     <img class="live" src="/video_feed" alt="实时画面" style="max-width:640px">
     <div id="infopanel" class="panel">
       <div class="panel-sec">
+        <div class="panel-title">任务状态</div>
+        <div id="mi-mission" class="kv">等待数据…</div>
+      </div>
+      <div class="panel-sec">
         <div class="panel-title">道路跟踪参数</div>
         <div id="mi-boundary" class="kv">等待数据…</div>
+      </div>
+      <div class="panel-sec">
+        <div class="panel-title">BTP 调试</div>
+        <div id="mi-btp" class="kv">未开启</div>
       </div>
     </div>
   </div>
@@ -112,6 +130,11 @@ async function refreshStatus() {
   detectBtn.disabled = false;
   detectBtn.className = recState.detecting ? 'detect-btn active' : 'detect-btn';
   detectBtn.textContent = recState.detecting ? '停止侦察' : '开始侦察';
+  const btp = recState.btp_debug || {};
+  document.getElementById('btp-left').className =
+    btp.active && btp.pose === 2 ? 'btp-btn active' : 'btp-btn';
+  document.getElementById('btp-right').className =
+    btp.active && btp.pose === 3 ? 'btp-btn active' : 'btp-btn';
   const viewSelect = document.getElementById('view-select');
   if (viewSelect && ['perception','ipm','front_raw','turn_raw',
                      'front_detection','turn_detection'].includes(recState.view_mode)) {
@@ -132,6 +155,20 @@ async function switchView(mode) {
 
 // 侧边参数面板：显示当前跟踪算法使用的阈值和扫描行。
 function renderInfoPanel() {
+  const m = recState.mission || {};
+  const missionHtml = !m.online
+    ? '<span style="color:#766">Mission 离线 / 无数据</span>'
+    : '阶段　<b>' + (m.mission_state_name || '—') + '</b>' +
+      '\n状态版本　<b>' + (m.revision ?? '—') + '</b>' +
+      '\n当前路段　<b>' + (m.segment_start ?? '—') + ' → ' +
+        (m.segment_goal ?? '—') + '（#' + (m.segment_index ?? '—') + '）</b>' +
+      '\n到达后动作　<b>' + (m.arrival_action_name || '—') + '</b>' +
+      '\n前视相机　<b>' + (m.front_camera_pose_name || '—') + '</b>' +
+      '\n转向相机　<b>' + (m.turn_camera_pose_name || '—') + '</b>' +
+      '\n剩余任务　<b>固定 ' + (m.fixed_remaining ?? '—') +
+        ' / 随机 ' + (m.random_remaining ?? '—') + '</b>';
+  document.getElementById('mi-mission').innerHTML = missionHtml;
+
   const b = recState.boundary || {};
   const statusText = ({0:'正常', 1:'无分割结果', 2:'道路跟踪失败',
                        3:'推理错误'})[b.status] ?? '未知状态';
@@ -143,11 +180,30 @@ function renderInfoPanel() {
       '\n左右边界　<b>' + (b.left ?? '—') + ' / ' + (b.right ?? '—') + ' px</b>' +
       '\n边界来源　<b>' + (b.boundary_source || '—') + '</b>' +
       '\n扫描行　<b>y = ' + (b.scan_y ?? '—') + ' px</b>' +
-      '\n道路宽度阈值　<b>' + (b.min_width ?? '—') +
+      '\n检测道路宽度　<b>' + (b.min_width ?? '—') +
       ' ~ ' + (b.max_width ?? '—') + ' px</b>' +
       '\n前视参考 x　<b>' + (b.front_reference_x ?? '—') + ' px</b>' +
       '\n转向参考 x　<b>' + (b.turn_reference_x ?? '—') + ' px</b>';
   document.getElementById('mi-boundary').innerHTML = html;
+
+  const d = recState.btp_debug || {};
+  const debugStatus = ({0:'正常', 1:'无分割结果', 2:'道路跟踪失败',
+                        3:'推理错误'})[d.status] ?? '未知状态';
+  const btpHtml = !d.active
+    ? '未开启（车身转向始终禁用）'
+    : '方向　<b>' + (d.pose === 2 ? '左侧' : '右侧') + '</b>' +
+      '\n感知　<b>' + (d.online ? debugStatus : '等待转向相机数据') + '</b>' +
+      '\n参考中心　<b>x = ' + (d.reference_x ?? '—') + ' px</b>' +
+      '\n偏差　<b>' + (d.online ? d.deviation : '—') + ' px</b>' +
+      '\n有效范围　<b>' + (d.min_deviation ?? '—') + ' ～ ' +
+        (d.max_deviation ?? '—') + ' px</b>' +
+      '\n连续满足　<b>' + (d.consecutive_frames ?? 0) + ' / ' +
+        (d.required_frames ?? '—') + ' 帧</b>' +
+      '\nBTP 条件　<b style="color:' +
+        (d.condition_met ? '#4d8' : '#e88') + '">' +
+        (d.condition_met ? '满足' : '未满足') + '</b>' +
+      '\n安全状态　<b>仅调试，不触发车身</b>';
+  document.getElementById('mi-btp').innerHTML = btpHtml;
 }
 
 async function toggleRecord() {
@@ -195,6 +251,24 @@ async function triggerDetect() {
     btn.disabled = false;
     text.textContent = '';
   }, 1000);
+}
+
+async function setBtpDebug(pose) {
+  const text = document.getElementById('btp-text');
+  text.textContent = '发送中…';
+  try {
+    const response = await fetch(
+      '/api/btp-debug/set?pose=' + encodeURIComponent(pose),
+      { method: 'POST' });
+    if (!response.ok) throw new Error('发送失败');
+    recState = await response.json();
+    text.textContent = pose === 'off' ? '已退出并复位' : '调试已开启';
+    if (pose !== 'off') await switchView('perception');
+    await refreshStatus();
+  } catch (e) {
+    text.textContent = '发送失败';
+  }
+  setTimeout(() => { text.textContent = ''; }, 1200);
 }
 
 function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }

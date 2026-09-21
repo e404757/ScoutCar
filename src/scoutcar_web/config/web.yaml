@@ -13,11 +13,13 @@ web_node:
     # 同一个网页按钮同时录制双 AVI 与轻量 rosbag。
     bag_dir: /home/orangepi/CityScout/data/bags
     bag_topics:
-      - /perception/seg_mask
-      - /perception/road_boundary
-      - /mission/deviation_enable
+      - /perception/road_deviation
+      - /perception/is_btp
+      - /mission/mission_state
+      - /mission/base_cmd
       - /mission/path_cmd
       - /mission/detect_task
+      - /perception/detect_results
       - /mcu/rx_event
       - /obstacle/event
     jpg_quality: 85

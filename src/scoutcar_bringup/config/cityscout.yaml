@@ -6,22 +6,26 @@ front_camera_node:
     image_height: 480
     image_topic: "/camera/front/image_raw"
     prefer_mipi: true
-
+    
 turn_camera_node:
   ros__parameters:
-    camera_path: "/dev/video22"
+    camera_path: "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
     fps: 30
     image_width: 640
     image_height: 480
     image_topic: "/camera/turn/image_raw"
-    prefer_mipi: true
+    prefer_mipi: false
 
 perception_node:
   ros__parameters:
-    ipm.front_source_points: [232.0, 190.0, 431.0, 190.0, 95.0, 420.0, 588.0, 420.0]
-    ipm.turn_source_points: [260.0, 190.0, 400.0, 190.0, 145.0, 420.0, 520.0, 420.0]
-    ipm.front_destination_points: [180.0, 120.0, 460.0, 120.0, 180.0, 470.0, 460.0, 470.0]
-    ipm.turn_destination_points: [170.0, 120.0, 470.0, 120.0, 170.0, 470.0, 470.0, 470.0]
+    enable_turning_inference: true
+
+    ipm.front_source_points: [269.0, 190.0, 414.0, 190.0, 142.0, 400.0, 544.0, 400.0]
+    ipm.turn_left_source_points: [270.0, 190.0, 381.0, 190.0, 130.0, 420.0, 451.0, 420.0]
+    ipm.turn_right_source_points: [290.0, 190.0, 409.0, 190.0, 210.0, 420.0, 536.0, 420.0]
+    ipm.front_destination_points: [190.0, 190.0, 450.0, 190.0, 190.0, 470.0, 450.0, 470.0]
+    ipm.turn_left_destination_points: [190.0, 120.0, 450.0, 120.0, 190.0, 470.0, 450.0, 470.0]
+    ipm.turn_right_destination_points: [190.0, 120.0, 450.0, 120.0, 190.0, 470.0, 450.0, 470.0]
 
     road_tracking.scan_end_y: 120
     road_tracking.min_road_width_px: 225
@@ -29,10 +33,19 @@ perception_node:
     road_tracking.min_barrier_width_px: 12
     road_tracking.search_expand_px: 20
     road_tracking.min_valid_rows: 60
-    road_tracking.front_reference_x: 312
-    road_tracking.turn_reference_x: 320
+    
+    road_tracking.front_reference_x: 315
+    road_tracking.turn_left_reference_x: 355
+    road_tracking.turn_right_reference_x: 291
 
-    detect.confidence_threshold: 0.25
+    btp.left.max_deviation: 40
+    btp.left.min_deviation: 20
+    btp.left.required_consecutive_frames: 1
+    btp.right.max_deviation: -30
+    btp.right.min_deviation: -50
+    btp.right.required_consecutive_frames: 1
+
+    detect.confidence_threshold: 0.8
     detect.nms_threshold: 0.45
 
 

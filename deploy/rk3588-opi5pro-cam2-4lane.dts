@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "rockchip,rk3588";
+
+    fragment@0 {
+        target-path = "/i2c@feab0000/ov13855-2@36/port/endpoint";
+
+        __overlay__ {
+            data-lanes = <1 2 3 4>;
+        };
+    };
+
+    fragment@1 {
+        target-path = "/csi2-dcphy0/ports/port@0/endpoint@1";
+
+        __overlay__ {
+            data-lanes = <1 2 3 4>;
+        };
+    };
+};

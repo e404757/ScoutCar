@@ -1,0 +1,8 @@
+verbosity=1
+bootlogo=false
+extraargs=cma=128M
+overlay_prefix=rk3588
+fdtfile=rockchip/rk3588s-orangepi-5-pro.dtb
+rootdev=UUID=f1879bea-0ed2-467c-924b-6ae5979d9172
+rootfstype=ext4
+overlays=opi5pro-cam1 opi5pro-cam2 opi5pro-disable-leds uart6-m1 wifi-pcie

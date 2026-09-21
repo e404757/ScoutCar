@@ -25,6 +25,7 @@ void uart_send_debug_ready(int fd, pathplan::Status st, uint8_t fixed_remain, ui
 void uart_send_path_segment(int fd, const pathplan::PathPlanFrame& seg); // 路径段帧 FF 02 [起点][终点][动作] DD
 void uart_send_deviation_frame(int fd, int16_t deviation);               // 中心偏差帧 FF 03 [符号][lo][hi] DD
 void uart_send_detect_task(int fd,pathplan::DetectStatus st,uint8_t left_result,uint8_t right_result);
+void uart_send_base_control(int fd, const pathplan::BaseCmdFrame& command); // FF 05 [是否执行动作][front][turn] DD
 // ── 接收线程：解析下位机帧 FF 01 00 [flag] 00 DD，回调上报事件 ──
 typedef void (*uart_rx_callback_t)(pathplan::RxFlag flag, void* user);
 void uart_start_rx_thread(int fd, uart_rx_callback_t cb, void* user);

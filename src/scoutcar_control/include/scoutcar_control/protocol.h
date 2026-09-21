@@ -25,18 +25,27 @@ enum class MsgType : uint8_t {
     PATH_PLANNING = 0x02,  // 路径段
     DEVIATION     = 0x03,  // 中心偏差
     DETECT        = 0x04,  // 目标识别
+    BASE_CONTROL  = 0x05,  // 车身动作触发与摄像头姿态控制
 };
 
-// 下位机回传 flag（接收帧 `FF 01 00 [flag] 00 DD` 的 flag 字节）
+
+enum class Pose : uint8_t {
+    UNKNOWN = 0x00,
+    AHEAD   = 0x01,
+    LEFT    = 0x02,
+    RIGHT   = 0x03,
+};
+
+
+//下位机回传
 enum class RxFlag : uint8_t {
-    START    = 0xAA,  // 启动小车，可发第一段路径
-    CAM_AHEAD = 0xBB,  // 摄像头朝前
-    CAM_TURNED = 0xCC,  // 摄像头转向两侧
-    ARRIVED  = 0xDD,  // 小车到达目标点，开始转向
+    START    = 0xAA,  // 小车启动
+    STOP     = 0xBB,  // 小车已经停止，重置状态等待启动
+    ARRIVED  = 0xDD,  // 小车接近目标点
     TURN_FINISHED = 0xEE,  // 小车转向结束，恢复循迹
+    HEARTED  = 0xFF,
 };
 
-// 转向动作（路径段帧的 action 字节）
 enum class TurnAction : uint8_t {
     STOP     = 0x00,  // 停车
     STRAIGHT = 0x01,  // 直行
@@ -45,7 +54,11 @@ enum class TurnAction : uint8_t {
     UTURN    = 0x04,  // 掉头
 };
 
-// 路径段消息：起点、终点、到达终点后执行的转向动作
+struct BaseCmdFrame {
+    bool need_turn;  // false=0x00 不执行，true=0x01 执行已保存的到达动作
+    Pose front;
+    Pose turn;
+};
 struct PathPlanFrame {
     uint8_t     start;        // 起点格点
     uint8_t     goal;         // 终点格点
@@ -140,6 +153,16 @@ inline size_t packDetectTask(uint8_t* buf,DetectStatus st,uint8_t left_result,ui
         right_result,
     };
     return packFrame(buf, MsgType::DETECT, payload, sizeof(payload));
+}
+
+// 车身与摄像头控制帧（FF 05 [need_turn][front][turn] DD，共 6 字节）
+inline size_t packBaseControl(uint8_t* buf, const BaseCmdFrame& msg) {
+    const uint8_t payload[3] = {
+        static_cast<uint8_t>(msg.need_turn),
+        static_cast<uint8_t>(msg.front),
+        static_cast<uint8_t>(msg.turn),
+    };
+    return packFrame(buf, MsgType::BASE_CONTROL, payload, sizeof(payload));
 }
 
 }  // namespace pathplan

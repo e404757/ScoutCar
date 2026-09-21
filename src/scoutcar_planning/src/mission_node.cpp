@@ -9,9 +9,9 @@
 
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
-#include <scoutcar_msgs/msg/mission_status.hpp>
-#include <scoutcar_msgs/msg/path_cmd.hpp>
 #include <scoutcar_msgs/msg/rx_event.hpp>
+#include <scoutcar_msgs/msg/car_state.hpp>
+
 
 #include "graph.h"
 #include "map.h"
@@ -50,16 +50,18 @@ public:
     }
     planner_.setConfig(cfg_);
   
+    const auto state_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+    pub_path_ = create_publisher<scoutcar_msgs::msg::CarState>("mission/path_cmd", 10);
+    pub_base_cmd_ = create_publisher<scoutcar_msgs::msg::CarState>(
+      "mission/base_cmd", rclcpp::QoS(10).reliable());
+    pub_debug_ = create_publisher<scoutcar_msgs::msg::CarState>(
+      "mission/debug_cmd",state_qos);
+    pub_mission_state_ = create_publisher<scoutcar_msgs::msg::CarState>(
+      "mission/mission_state", state_qos);
 
-    pub_path_ = create_publisher<scoutcar_msgs::msg::PathCmd>("mission/path_cmd", 10);
-    const auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
-    pub_car_status_ = create_publisher<scoutcar_msgs::msg::MissionStatus>(
-      "mission/car_status", status_qos);
-    pub_cam_status_ = create_publisher<std_msgs::msg::Bool>("mission/cam_status",status_qos);
-    pub_dev_ = create_publisher<std_msgs::msg::Bool>("mission/deviation_enable", 10);
     sub_event_ = create_subscription<scoutcar_msgs::msg::RxEvent>(
       "mcu/rx_event", 10,
-      [this](const scoutcar_msgs::msg::RxEvent::SharedPtr msg) { on_event(msg->event); });
+      [this](const scoutcar_msgs::msg::RxEvent::SharedPtr msg) { on_mcu_event(msg->event); });
 
     sub_recon_ = create_subscription<std_msgs::msg::Bool>(
       "mission/recon_found", 10,
@@ -68,28 +70,32 @@ public:
           on_recon_found();
         }
       });
+    sub_is_btp_ = create_subscription<std_msgs::msg::Empty>(//感知节点在FINDING_BTP状态找到合适时机发送该消息
+      "perception/is_btp",10,
+      [this](const std_msgs::msg::Empty::SharedPtr) {  do_turning(); });
     sub_obstacle_ = create_subscription<std_msgs::msg::Empty>(
       "obstacle/event", 10,
-      [this](const std_msgs::msg::Empty::SharedPtr) { do_obstacle(); });
-    publish_status();
+      [this](const std_msgs::msg::Empty::SharedPtr) {  });
+
+    prepare_mission();
   }
 
 private:
   
-
-  void on_event(uint8_t event)
+  void on_mcu_event(uint8_t event)
   {
     switch (event) {
       case scoutcar_msgs::msg::RxEvent::START:
-        do_restart();
+        if (car_state_.mission_state == scoutcar_msgs::msg::CarState::WAIT_START &&
+            car_state_.system_status == scoutcar_msgs::msg::CarState::SYSTEM_READY &&
+            segments_.size() >= 2) {
+          do_start();
+        } else {
+          RCLCPP_WARN(get_logger(), "当前状态不允许启动任务");
+        }
         break;
-      case scoutcar_msgs::msg::RxEvent::CAM_AHEAD:
-        cam_msg.data = false;
-        pub_cam_status_->publish(cam_msg);//表示未转
-        break;
-      case scoutcar_msgs::msg::RxEvent::CAM_TURNED:
-        cam_msg.data = true;
-        pub_cam_status_->publish(cam_msg);//表示转了
+      case scoutcar_msgs::msg::RxEvent::STOP:
+        prepare_mission();
         break;
       case scoutcar_msgs::msg::RxEvent::ARRIVED:
         on_arrived();
@@ -101,210 +107,123 @@ private:
         break;
     }
   }
-
-  void do_restart()
+  
+  void prepare_mission()
   {
-    set_deviation(false);
-    if (replan_mission() != 0) {
+    car_state_.mission_state = scoutcar_msgs::msg::CarState::FINISHED;
+    car_state_.system_status = scoutcar_msgs::msg::CarState::SYSTEM_UNKNOWN;
+    car_state_.fixed_remaining = static_cast<uint8_t>(kFixedPoints.size());
+    car_state_.random_remaining = static_cast<uint8_t>(recon_target);
+
+    car_state_.segment_start = -1;
+    car_state_.segment_goal = -1;
+    car_state_.segment_index = -1;
+    
+    //约定下位机发送bb和初始情况下摄像头已复位且停止
+    car_state_.front_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+    car_state_.turn_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+    car_state_.arrival_action = scoutcar_msgs::msg::CarState::DIRECTION_NONE;
+    car_state_.recon_result_valid = false;
+    car_state_.recon_left_result = 0;
+    car_state_.recon_right_result = 0;
+
+    publish_car_state();
+
+    if (replan_mission() != 0 || segments_.size() < 2) {
       RCLCPP_WARN(get_logger(), "重新规划失败，保持等待");
+      car_state_.system_status = scoutcar_msgs::msg::CarState::SYSTEM_ERROR;
+      pub_debug_->publish(car_state_);
+      publish_car_state();
       return;
     }
-    fixed_remain_ = static_cast<int>(kFixedPoints.size());
-    random_remain_ = recon_target;
-    waiting_uturn_finished_ = false;
-    waiting_turn_finished_ = false;
-    returning_to_previous_node_ = false;
-    mission_started_ = true;
-    mission_done_ = false;
-    publish_status();
-  
-    send_segment(0);
-    pending_from_ = segments_[0].node;
-    pending_arrival_ = segments_[0].next;
-    first_segment_sent_ = true;
-    seg_index_ = 1;
-    set_deviation(true);
-    RCLCPP_INFO(get_logger(), "任务已复位，开始新一轮（共 %zu 段）", segments_.size());
+
+    car_state_.system_status = scoutcar_msgs::msg::CarState::SYSTEM_READY;
+    car_state_.mission_state = scoutcar_msgs::msg::CarState::WAIT_START;
+    pub_debug_->publish(car_state_);
+    publish_car_state();
+    RCLCPP_INFO(get_logger(), "准备就绪，等待启动命令，路径共 %zu 段）", segments_.size()-1);
+
+  }
+  void do_start()
+  {
+    car_state_.mission_state = scoutcar_msgs::msg::CarState::DRIVING;
+    car_state_.segment_start = segments_[0].node;
+    car_state_.segment_goal = segments_[0].next;
+    car_state_.arrival_action = static_cast<uint8_t>(segments_[1].action);
+    car_state_.segment_index = 0;
+    RCLCPP_INFO(get_logger(), "任务开始");
+    pub_path_->publish(car_state_);
+    publish_car_state();
   }
 
-  // 0xDD：到达路口并开始执行动作。上位机知道自己发的下一段帧里带的 action，
-  // 它就是小车此刻正在执行的动作（= segments_[seg_index_].action）：
-  //   左转/右转/掉头 → 真转向，偏差置 0（帧流不断），直到 EE 恢复；
-  //   直行/停车     → 路口直行通过（MCU 会 DD 后紧跟 EE），偏差保持真实值不中断。
   void on_arrived()
   {
-    if (!mission_started_ || mission_done_) {
+    if(car_state_.mission_state != scoutcar_msgs::msg::CarState::DRIVING){
+      RCLCPP_WARN(get_logger(),"小车在非巡航期间接受到到达命令(来自串口)");
       return;
     }
-    const TurnAction acting = returning_to_previous_node_
-      ? obstacle_return_action_
-      : (seg_index_ < segments_.size()
-          ? segments_[seg_index_].action : TurnAction::STOP);
-    if (acting == TurnAction::LEFT || acting == TurnAction::RIGHT || acting == TurnAction::UTURN)
-    {
-      set_deviation(false);
-    }
-    if (waiting_uturn_finished_) {
-      RCLCPP_DEBUG(get_logger(), "掉头尚未完成，忽略到达通知");
+
+    switch (car_state_.arrival_action) {
+    case scoutcar_msgs::msg::CarState::DIRECTION_AHEAD: {//小车直行，复位转向摄像头
+      record_arrival_at_node();
+      car_state_.turn_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+      advance_to_next_segment();
       return;
     }
-    // 障碍后的第一次到达，是沿原路返回上一节点。此时返回段携带的 action
-    // 已经开始执行，再下发重规划路线的第一段，供转向完成后继续行驶。
-    if (returning_to_previous_node_) {
-      current_node_ = obstacle_previous_node_;
-      returning_to_previous_node_ = false;
-      send_segment(0);
-      pending_from_ = segments_[0].node;
-      pending_arrival_ = segments_[0].next;
-      first_segment_sent_ = true;
-      seg_index_ = 1;
-      publish_status();
-      RCLCPP_INFO(get_logger(), "已返回节点 %d，发送重规划后的第一段",
-                  current_node_);
+    case scoutcar_msgs::msg::CarState::DIRECTION_LEFT:
+    case scoutcar_msgs::msg::CarState::DIRECTION_RIGHT://小车接近路口转向，转动转向摄像头，等待感知节点发送转向命令
+      car_state_.mission_state = scoutcar_msgs::msg::CarState::FINDING_BTP;
+      car_state_.turn_camera_pose = car_state_.arrival_action;
+      break;
+    case scoutcar_msgs::msg::CarState::DIRECTION_NONE://小车停车，已经到达终点
+      record_arrival_at_node();
+      car_state_.mission_state = scoutcar_msgs::msg::CarState::FINISHED;
+      car_state_.segment_start = -1;
+      car_state_.segment_goal = -1;
+      car_state_.segment_index = -1;
+      car_state_.arrival_action = scoutcar_msgs::msg::CarState::DIRECTION_NONE;
+      publish_car_state();
+      pub_base_cmd_->publish(car_state_);
+      RCLCPP_INFO(get_logger(), "任务完成，小车停在节点 %d", current_node_);
+      return;
+    case scoutcar_msgs::msg::CarState::DIRECTION_UTURN:
+      record_arrival_at_node();
+      car_state_.mission_state = scoutcar_msgs::msg::CarState::TURNING;
+      car_state_.front_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+      car_state_.turn_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+      publish_car_state();
+      pub_base_cmd_->publish(car_state_);
+      return;
+    default:
+      RCLCPP_ERROR(get_logger(), "未知到达动作 %u", car_state_.arrival_action);
       return;
     }
-    if (!first_segment_sent_) {
-      send_segment(0);
-      pending_from_ = segments_[0].node;
-      pending_arrival_ = segments_[0].next;
-      first_segment_sent_ = true;
-      return;
-    }
-    // 正常推进：更新位置与已搜索边
-    if (pending_arrival_ > 0) {
-      current_node_ = pending_arrival_;
-      on_fixed_reached(current_node_);
-      if (pending_from_ > 0) {
-        mission::Edge e = mission::normEdge(pending_from_, pending_arrival_);
-        searched_edges_.insert(e);
-        if (std::find(kTunnels.begin(), kTunnels.end(), e) != kTunnels.end()) {
-          tunnel_done_.insert(e);
-        }
-      }
-      // 侦查点钩子：v1 由 /mission/recon_found 订阅触发（原 on_edge_traversed 写死 false）
-    }
-    // 侦查点找齐：收尾重规划（原收尾分支）
-    if (recon_found_ >= recon_target && !recon_finished_) {
-      recon_finished_ = true;
-      if (replan_from_current() == 0) {
-        RCLCPP_INFO(get_logger(), "侦查点找齐，收尾重规划");
-        send_segment(0);
-        pending_from_ = segments_[0].node;
-        pending_arrival_ = segments_[0].next;
-        first_segment_sent_ = true;
-        seg_index_ = 1;
-        mission_started_ = true;
-        mission_done_ = false;
-      }
-    } else if (seg_index_ < segments_.size() - 1) {
-      send_segment(seg_index_);
-      pending_from_ = segments_[seg_index_].node;
-      pending_arrival_ = segments_[seg_index_].next;
-      seg_index_++;
-      if (seg_index_ >= segments_.size() - 1) {
-        mission_done_ = true;
-        RCLCPP_INFO(get_logger(), "已发送最后一段（终点停车），任务结束");
-      }
-    } else {
-      mission_done_ = true;
-      RCLCPP_INFO(get_logger(), "任务结束");
-    }
-    publish_status();
+    car_state_.front_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+    publish_car_state();
+    pub_base_cmd_->publish(car_state_);
   }
 
-  // 0xEE：动作执行结束。真转向 → 恢复偏差；路口直行（DD 后紧跟 EE）→ 偏差
-  // 从未关闭，重发一次启用是幂等确认。障碍掉头则先发重规划后的第一段。
+  void do_turning()//向小车发送车身转向和摄像头转回命令
+  {
+    if(car_state_.mission_state != scoutcar_msgs::msg::CarState::FINDING_BTP){
+      RCLCPP_WARN(get_logger(),"小车在非路口接受到左右转向命令（来自感知节点)");
+      return;
+    }
+    car_state_.mission_state = scoutcar_msgs::msg::CarState::TURNING;
+    car_state_.front_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+    car_state_.turn_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+    record_arrival_at_node();
+    publish_car_state();
+    pub_base_cmd_->publish(car_state_);
+  }
+
   void on_turn_finished()
-  {
-    if (!mission_started_) {
+  {//默认没走完
+    if(car_state_.mission_state != scoutcar_msgs::msg::CarState::TURNING){
+      RCLCPP_WARN(get_logger(),"在非转向时接收到转向完成的消息(来自串口)");
       return;
     }
-    waiting_turn_finished_ = false;
-    if (mission_done_) {
-      return;
-    }
-    if (waiting_uturn_finished_) {
-      if (segments_.empty()) {
-        RCLCPP_WARN(get_logger(), "掉头结束，但重规划路径为空");
-        return;
-      }
-      send_obstacle_return_segment();
-      pending_from_ = obstacle_blocked_goal_;
-      pending_arrival_ = obstacle_previous_node_;
-      returning_to_previous_node_ = true;
-      first_segment_sent_ = false;
-      waiting_uturn_finished_= false;
-      seg_index_ = 1;
-    }
-    set_deviation(true);
-    RCLCPP_INFO(get_logger(), "转向完成，恢复循迹偏差发送");
-  }
-
-  // 障碍事件：阻断当前边 + 重规划 + 发掉头。
-  // 真实检测节点和 Web 模拟按钮都只需发布 /obstacle/event。
-  void do_obstacle()
-  {
-    if (!mission_started_ || mission_done_) {
-      RCLCPP_WARN(get_logger(), "当前没有执行中的任务，忽略障碍事件");
-      return;
-    }
-    if (waiting_uturn_finished_) {
-      RCLCPP_WARN(get_logger(), "正在等待障碍掉头完成，忽略重复障碍事件");
-      return;
-    }
-    if (returning_to_previous_node_) {
-      RCLCPP_WARN(get_logger(), "正在返回障碍前的节点，忽略重复障碍事件");
-      return;
-    }
-    if (pending_from_ <= 0 || pending_arrival_ <= 0) {
-      RCLCPP_WARN(get_logger(), "当前没有正在行驶的有效路径段，忽略障碍事件");
-      return;
-    }
-
-    obstacle_previous_node_ = pending_from_;
-    obstacle_blocked_goal_ = pending_arrival_;
-    set_deviation(false);
-    graph_.setBlocked(pending_from_, pending_arrival_, true);
-    blocked_edges_.insert({pending_from_, pending_arrival_});
-    RCLCPP_INFO(get_logger(), "阻断边 %d→%d（单向，反向仍可走）", pending_from_, pending_arrival_);
-    if (replan_from_current() != 0) {
-      RCLCPP_WARN(get_logger(), "障碍重规划失败");
-      return;
-    }
-    // 掉头后沿 B→A 返回。到达 A 时的动作必须根据来向 B→A 和新路线
-    // 首边 A→C 计算，不能使用规划器默认的“起点朝向首边”。
-    obstacle_return_action_ = TurnAction::STOP;
-    if (!segments_.empty() && segments_[0].next > 0) {
-      const Heading incoming =
-        edgeHeading(obstacle_blocked_goal_, obstacle_previous_node_);
-      const Heading outgoing =
-        edgeHeading(obstacle_previous_node_, segments_[0].next);
-      obstacle_return_action_ = turnAction(incoming, outgoing);
-    }
-    scoutcar_msgs::msg::PathCmd ut;
-    ut.start = static_cast<uint8_t>(current_node_);
-    ut.goal = static_cast<uint8_t>(current_node_);
-    ut.action = scoutcar_msgs::msg::PathCmd::UTURN;
-    pub_path_->publish(ut);
-    waiting_uturn_finished_= true;
-    waiting_turn_finished_ = true;
-    mission_started_ = true;
-    mission_done_ = false;
-    first_segment_sent_ = false;
-    seg_index_ = 1;
-    RCLCPP_INFO(get_logger(), "障碍，已发送掉头");
-  }
-
-  void send_obstacle_return_segment()
-  {
-    scoutcar_msgs::msg::PathCmd cmd;
-    cmd.start = static_cast<uint8_t>(obstacle_blocked_goal_);
-    cmd.goal = static_cast<uint8_t>(obstacle_previous_node_);
-    cmd.action = static_cast<uint8_t>(obstacle_return_action_);
-    pub_path_->publish(cmd);
-    RCLCPP_INFO(get_logger(),
-                "[任务] 障碍返回段 %u→%u，到达后动作[%s]",
-                cmd.start, cmd.goal, actionName(obstacle_return_action_));
+    advance_to_next_segment();
   }
 
   // ═══════════════ 规划 ═══════════════
@@ -321,9 +240,9 @@ private:
     searched_edges_.clear();
     recon_found_ = 0;
     recon_finished_ = false;
-    current_node_ = 1;
-    pending_from_ = -1;
-    pending_arrival_ = -1;
+    current_node_ = cfg_.home;
+    car_state_.fixed_remaining = static_cast<uint8_t>(kFixedPoints.size());
+    car_state_.random_remaining = static_cast<uint8_t>(recon_target);
     return replan_from_current();
   }
 
@@ -362,97 +281,95 @@ private:
     return 0;
   }
 
-  // ═══════════════ 发布与状态 ═══════════════
-
-  // 发布第 i 段路径（语义与原 sendSegmentLog 一致：action = 到达 goal 后执行的动作）
-  void send_segment(size_t i)
+  void publish_car_state()
   {
-    if (segments_.empty() || i >= segments_.size()) {
+    car_state_.header.stamp = now();
+    ++car_state_.revision;
+    pub_mission_state_->publish(car_state_);
+  }
+
+  void record_arrival_at_node()
+  {
+    const int reached_node = car_state_.segment_goal;
+    if (reached_node < 0) {
       return;
     }
-    const StepCommand& cur = segments_[i];
-    const uint8_t goal = cur.next >= 0
-      ? static_cast<uint8_t>(cur.next)
-      : static_cast<uint8_t>(cur.node);
-    TurnAction act = TurnAction::STOP;
-    if (i + 1 < segments_.size()) {
-      act = segments_[i + 1].action;
+
+    current_node_ = reached_node;
+
+    if (car_state_.segment_start >= 0) {
+      const mission::Edge edge =
+        mission::normEdge(car_state_.segment_start, reached_node);
+      searched_edges_.insert(edge);
+      if (std::find(kTunnels.begin(), kTunnels.end(), edge) != kTunnels.end()) {
+        tunnel_done_.insert(edge);
+      }
     }
 
-    scoutcar_msgs::msg::PathCmd cmd;
-    cmd.start = static_cast<uint8_t>(cur.node);
-    cmd.goal = goal;
-    cmd.action = static_cast<uint8_t>(act);
-    pub_path_->publish(cmd);
-    RCLCPP_INFO(get_logger(), "[任务] 路径段 %u→%u 到达后动作[%s]",
-                cmd.start, cmd.goal, actionName(act));
-  }
-
-  void set_deviation(bool enabled)
-  {
-    std_msgs::msg::Bool b;
-    b.data = enabled;
-    pub_dev_->publish(b);
-  }
-
-  void publish_status()
-  {
-    scoutcar_msgs::msg::MissionStatus st;
-    st.status = scoutcar_msgs::msg::MissionStatus::READY;
-    st.fixed_remain = static_cast<uint8_t>(fixed_remain_);
-    st.random_remain = static_cast<uint8_t>(random_remain_);
-    st.current_node = current_node_;
-    st.seg_index = static_cast<int32_t>(seg_index_);
-    st.state = mission_done_ ? 2 : (mission_started_ ? 1 : 0);
-    pub_car_status_->publish(st);
-  }
-
-  void on_fixed_reached(int node)
-  {
-    if (!kFixedSet.count(node)) {
-      return;  // 非固定点不计数
+    if (kFixedSet.count(reached_node) && fixed_done_.insert(reached_node).second) {
+      if (car_state_.fixed_remaining > 0) {
+        --car_state_.fixed_remaining;
+      }
+      RCLCPP_INFO(
+        get_logger(), "到达固定点 %d，剩余固定点 %u",
+        reached_node, static_cast<unsigned>(car_state_.fixed_remaining));
     }
-    if (fixed_done_.insert(node).second) {
-      fixed_remain_ = fixed_remain_ > 0 ? fixed_remain_ - 1 : 0;
-      publish_status();
-      RCLCPP_INFO(get_logger(), "到达固定点 %d，剩余固定 %d / 随机 %d",
-                  node, fixed_remain_, random_remain_);
+  }
+
+  void advance_to_next_segment()
+  {
+    const int next_index = car_state_.segment_index + 1;
+    if (next_index < 0 ||
+        static_cast<size_t>(next_index + 1) >= segments_.size()) {
+      RCLCPP_ERROR(
+        get_logger(), "无法推进路径：当前段=%d，路径记录数=%zu",
+        car_state_.segment_index, segments_.size());
+      car_state_.mission_state = scoutcar_msgs::msg::CarState::FINISHED;
+      car_state_.segment_start = -1;
+      car_state_.segment_goal = -1;
+      car_state_.segment_index = -1;
+      car_state_.arrival_action = scoutcar_msgs::msg::CarState::DIRECTION_NONE;
+      pub_base_cmd_->publish(car_state_);
+      publish_car_state();
+      return;
     }
+
+    car_state_.segment_index = next_index;
+    car_state_.segment_start = segments_[next_index].node;
+    car_state_.segment_goal = segments_[next_index].next;
+    car_state_.arrival_action =
+      static_cast<uint8_t>(segments_[next_index + 1].action);
+    car_state_.mission_state = scoutcar_msgs::msg::CarState::DRIVING;
+
+    pub_path_->publish(car_state_);
+    pub_base_cmd_->publish(car_state_);
+    publish_car_state();
   }
 
   void on_recon_found()
   {
-    random_remain_ = random_remain_ > 0 ? random_remain_ - 1 : 0;
-    if (recon_found_ < cfg_.recon_target) {
-      recon_found_++;
+    if (recon_found_ >= recon_target) {
+      return;
     }
-    publish_status();
-    RCLCPP_INFO(get_logger(), "找到侦查点，剩余固定 %d / 随机 %d（已找 %d/%d）",
-                fixed_remain_, random_remain_, recon_found_, cfg_.recon_target);
+
+    ++recon_found_;
+    if (car_state_.random_remaining > 0) {
+      --car_state_.random_remaining;
+    }
+    publish_car_state();
+    RCLCPP_INFO(
+      get_logger(), "找到侦察目标，剩余 %u（已找到 %d/%d）",
+      static_cast<unsigned>(car_state_.random_remaining),
+      recon_found_, recon_target);
+
   }
 
-  
-  bool mission_started_ = false;
-  bool mission_done_ = false;
-  bool first_segment_sent_ = false;
-  bool waiting_uturn_finished_ = false;
-  bool waiting_turn_finished_ = false;
-  bool returning_to_previous_node_ = false;
-
   std::vector<StepCommand> segments_;
-  size_t seg_index_ = 1;
-  int current_node_ = 1;
-  int pending_from_ = -1;
-  int pending_arrival_ = -1;
-  int obstacle_previous_node_ = -1;
-  int obstacle_blocked_goal_ = -1;
-  TurnAction obstacle_return_action_ = TurnAction::STRAIGHT;
 
-  int fixed_remain_ = static_cast<int>(kFixedPoints.size());//固定点剩余数量
-  int random_remain_ = recon_target;//侦察点剩余数量
+
   int recon_found_ = 0;//已发现侦察点数量
   bool recon_finished_ = false;//侦察任务是否完成
-  std_msgs::msg::Bool cam_msg;
+  int current_node_ = 1;// Mission 内部记录最后确认到达的节点
 
   std::set<int> fixed_done_;
   std::set<mission::Edge> searched_edges_;
@@ -464,14 +381,17 @@ private:
   Graph graph_;
   mission::MissionPlanner planner_;
 
-  rclcpp::Publisher<scoutcar_msgs::msg::PathCmd>::SharedPtr pub_path_;
-  rclcpp::Publisher<scoutcar_msgs::msg::MissionStatus>::SharedPtr pub_car_status_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_dev_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_cam_status_;
+  scoutcar_msgs::msg::CarState car_state_;
+
+  rclcpp::Publisher<scoutcar_msgs::msg::CarState>::SharedPtr pub_base_cmd_;
+  rclcpp::Publisher<scoutcar_msgs::msg::CarState>::SharedPtr pub_path_;
+  rclcpp::Publisher<scoutcar_msgs::msg::CarState>::SharedPtr pub_mission_state_;
+  rclcpp::Publisher<scoutcar_msgs::msg::CarState>::SharedPtr pub_debug_;
 
   rclcpp::Subscription<scoutcar_msgs::msg::RxEvent>::SharedPtr sub_event_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_recon_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_obstacle_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_is_btp_;
 
 };
 
