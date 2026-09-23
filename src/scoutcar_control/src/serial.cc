@@ -50,17 +50,9 @@ int uart_init(const char* device, int baud)
         wp_setup_done = 1;
     }
 
-    int fd = -1;
-    int max_retry = 30;  // 最多等 30 秒
-    for (int retry = 0; retry < max_retry; retry++) {
-        fd = serialOpen(device, baud);
-        if (fd >= 0) break;
-        printf("uart: 等待 %s ... (%d/%d)\n", device, retry + 1, max_retry);
-        sleep(1);
-    }
-
+    const int fd = serialOpen(device, baud);
     if (fd < 0)
-        printf("uart: 无法打开 %s（超时 %d 秒）\n", device, max_retry);
+        printf("uart: 无法打开 %s\n", device);
     else
         printf("uart: %s @ %d bps 就绪\n", device, baud);
     return fd;
@@ -167,7 +159,7 @@ void uart_send_base_control(int fd, const pathplan::BaseCmdFrame& command)
 // ═══════════════ 接收线程 ═══════════════
 
 // 解析下位机帧: FF 01 00 [flag] 00 DD
-// flag=0xAA 启动 / 0xDD 到达并开始转向 / 0xEE 转向结束
+// flag=0xAA 启动 / 0xCC 进入 BTP / 0xDD 到达最佳转向点 / 0xEE 转向结束 / 0xFF 心跳
 static void rx_loop()
 {
     enum State { WAIT_FF, WAIT_01, WAIT_00_1, READ_FLAG, WAIT_00_2, WAIT_DD };
@@ -203,8 +195,10 @@ static void rx_loop()
                     case READ_FLAG:
                         if (byte == (int)pathplan::RxFlag::START ||
                             byte == (int)pathplan::RxFlag::STOP ||
+                            byte == (int)pathplan::RxFlag::BTP ||
                             byte == (int)pathplan::RxFlag::ARRIVED ||
-                            byte == (int)pathplan::RxFlag::TURN_FINISHED) {
+                            byte == (int)pathplan::RxFlag::TURN_FINISHED ||
+                            byte == (int)pathplan::RxFlag::HEARTED) {
                             pending_flag = static_cast<pathplan::RxFlag>(byte);
                             state = WAIT_00_2;
                         } else {

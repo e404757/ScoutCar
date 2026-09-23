@@ -14,7 +14,6 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <scoutcar_msgs/msg/car_state.hpp>
-#include <scoutcar_msgs/msg/btp_debug.hpp>
 #include <scoutcar_msgs/msg/detect_task.hpp>
 #include <scoutcar_msgs/msg/road_deviation.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -31,7 +30,6 @@
 #include "page_html.h"
 
 using scoutcar_msgs::msg::CarState;
-using scoutcar_msgs::msg::BtpDebug;
 using scoutcar_msgs::msg::RoadDeviation;
 using sensor_msgs::msg::Image;
 
@@ -63,10 +61,10 @@ public:
         "bag_dir", "/home/orangepi/CityScout/data/bags");
     bag_topics_ = declare_parameter<std::vector<std::string>>(
         "bag_topics",
-        {"/perception/road_deviation", "/perception/is_btp",
+        {"/perception/road_deviation",
          "/mission/mission_state", "/mission/base_cmd",
          "/mission/path_cmd", "/mission/detect_task",
-         "/perception/detect_results", "/mcu/rx_event",
+         "/perception/recon_result", "/mcu/rx_event",
          "/obstacle/event"});
     jpg_quality_ = declare_parameter<int>("jpg_quality", 85);
 
@@ -96,9 +94,6 @@ public:
     sub_boundary_ = create_subscription<RoadDeviation>(
         "/perception/road_deviation", 10,
         [this](const RoadDeviation::SharedPtr msg) { onBoundary(msg); });
-    sub_btp_debug_ = create_subscription<BtpDebug>(
-        "/perception/btp_debug", 10,
-        [this](const BtpDebug::SharedPtr msg) { onBtpDebug(msg); });
     pub_obstacle_ =
         create_publisher<std_msgs::msg::Empty>("/obstacle/event", 10);
     const auto detect_qos =
@@ -344,12 +339,6 @@ private:
     std::lock_guard<std::mutex> lock(boundary_mutex_);
     latest_boundary_ = *msg;
     boundary_time_ = std::chrono::steady_clock::now();
-  }
-
-  void onBtpDebug(const BtpDebug::SharedPtr msg) {
-    std::lock_guard<std::mutex> lock(btp_debug_mutex_);
-    latest_btp_debug_ = *msg;
-    btp_debug_time_ = std::chrono::steady_clock::now();
   }
 
   void onMissionState(const CarState::SharedPtr msg) {
@@ -599,6 +588,7 @@ private:
     case CarState::TURNING: return "转向";
     case CarState::DETECTING: return "侦察";
     case CarState::FINISHED: return "结束/不可执行";
+    case CarState::ERROR: return "错误/无法执行任务";
     default: return "未知";
     }
   }
@@ -666,17 +656,17 @@ private:
       snprintf(
           state_buf, sizeof(state_buf),
           "{\"online\":%s,\"age_ms\":%lld,\"revision\":%u,"
-          "\"system_status\":%u,\"mission_state\":%u,"
+          "\"mission_state\":%u,"
           "\"mission_state_name\":\"%s\","
           "\"fixed_remaining\":%u,\"random_remaining\":%u,"
           "\"segment_start\":%d,"
           "\"segment_goal\":%d,\"segment_index\":%d,"
           "\"arrival_action\":%u,\"arrival_action_name\":\"%s\","
           "\"front_camera_pose\":%u,\"front_camera_pose_name\":\"%s\","
-          "\"turn_camera_pose\":%u,\"turn_camera_pose_name\":\"%s\"}",
+          "\"turn_camera_pose\":%u,\"turn_camera_pose_name\":\"%s\","
+          "\"route_segment_offset\":%d}",
           online ? "true" : "false", ms,
           state ? state->revision : 0U,
-          state ? static_cast<unsigned>(state->system_status) : 0U,
           state ? static_cast<unsigned>(state->mission_state) : 0U,
           state ? missionStateName(state->mission_state) : "无数据",
           state ? static_cast<unsigned>(state->fixed_remaining) : 0U,
@@ -689,37 +679,29 @@ private:
           state ? static_cast<unsigned>(state->front_camera_pose) : 0U,
           state ? directionName(state->front_camera_pose) : "无数据",
           state ? static_cast<unsigned>(state->turn_camera_pose) : 0U,
-          state ? directionName(state->turn_camera_pose) : "无数据");
+          state ? directionName(state->turn_camera_pose) : "无数据",
+          state ? state->route_segment_offset : 0);
       mission_json = state_buf;
+      if (!mission_json.empty() && mission_json.back() == '}') {
+        mission_json.pop_back();
+      }
+      mission_json += ",\"route_nodes\":[";
+      if (state) {
+        for (size_t i = 0; i < state->route_nodes.size(); ++i) {
+          if (i > 0) {
+            mission_json += ',';
+          }
+          mission_json += std::to_string(state->route_nodes[i]);
+        }
+      }
+      mission_json += "]}";
     }
 
-    std::string btp_debug_json;
-    {
-      std::lock_guard<std::mutex> lock(btp_debug_mutex_);
-      const long long ms = ageMs(btp_debug_time_);
-      const BtpDebug *debug =
-          latest_btp_debug_ ? &*latest_btp_debug_ : nullptr;
-      char debug_buf[512];
-      snprintf(
-          debug_buf, sizeof(debug_buf),
-          "{\"active\":%s,\"pose\":%u,\"online\":%s,"
-          "\"status\":%u,\"deviation\":%d,\"reference_x\":%d,"
-          "\"min_deviation\":%d,\"max_deviation\":%d,"
-          "\"consecutive_frames\":%u,\"required_frames\":%u,"
-          "\"condition_met\":%s}",
-          btp_debug_pose_.load() != 0 ? "true" : "false",
-          static_cast<unsigned>(btp_debug_pose_.load()),
-          debug != nullptr && ms >= 0 && ms <= 1500 ? "true" : "false",
-          debug ? static_cast<unsigned>(debug->status) : 0U,
-          debug ? static_cast<int>(debug->deviation) : 0,
-          debug ? debug->reference_x : 0,
-          debug ? static_cast<int>(debug->min_deviation) : 0,
-          debug ? static_cast<int>(debug->max_deviation) : 0,
-          debug ? static_cast<unsigned>(debug->consecutive_frames) : 0U,
-          debug ? static_cast<unsigned>(debug->required_frames) : 0U,
-          debug && debug->condition_met ? "true" : "false");
-      btp_debug_json = debug_buf;
-    }
+    char btp_debug_buf[64];
+    snprintf(btp_debug_buf, sizeof(btp_debug_buf),
+             "{\"active\":%s,\"pose\":%u}",
+             btp_debug_pose_.load() != 0 ? "true" : "false",
+             static_cast<unsigned>(btp_debug_pose_.load()));
 
     char buf[4096];
     snprintf(buf, sizeof(buf),
@@ -731,7 +713,7 @@ private:
              bag_recorder_.active() ? "true" : "false",
              detect_active_.load() ? "true" : "false",
              viewModeName(view_mode_.load()), boundary_json.c_str(),
-             mission_json.c_str(), btp_debug_json.c_str());
+             mission_json.c_str(), btp_debug_buf);
     return std::string(buf);
   }
 
@@ -755,7 +737,6 @@ private:
   rclcpp::Subscription<Image>::SharedPtr sub_debug_;
   rclcpp::Subscription<Image>::SharedPtr sub_ipm_debug_;
   rclcpp::Subscription<RoadDeviation>::SharedPtr sub_boundary_;
-  rclcpp::Subscription<BtpDebug>::SharedPtr sub_btp_debug_;
   rclcpp::Subscription<CarState>::SharedPtr sub_mission_state_;
   rclcpp::Subscription<Image>::SharedPtr sub_front_detection_;
   rclcpp::Subscription<Image>::SharedPtr sub_turn_detection_;
@@ -773,9 +754,6 @@ private:
   std::optional<RoadDeviation> latest_boundary_;
   std::chrono::steady_clock::time_point boundary_time_{};
 
-  std::mutex btp_debug_mutex_;
-  std::optional<BtpDebug> latest_btp_debug_;
-  std::chrono::steady_clock::time_point btp_debug_time_{};
 
   std::mutex mission_state_mutex_;
   std::optional<CarState> latest_mission_state_;

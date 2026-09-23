@@ -41,7 +41,8 @@ enum class Pose : uint8_t {
 enum class RxFlag : uint8_t {
     START    = 0xAA,  // 小车启动
     STOP     = 0xBB,  // 小车已经停止，重置状态等待启动
-    ARRIVED  = 0xDD,  // 小车接近目标点
+    BTP = 0xCC,  // 进入 BTP 阶段，上位机转动转向相机
+    ARRIVED  = 0xDD,  // 到达最佳转向点，下位机开始转向
     TURN_FINISHED = 0xEE,  // 小车转向结束，恢复循迹
     HEARTED  = 0xFF,
 };
@@ -55,7 +56,12 @@ enum class TurnAction : uint8_t {
 };
 
 struct BaseCmdFrame {
-    bool need_turn;  // false=0x00 不执行，true=0x01 执行已保存的到达动作
+    enum class Control : uint8_t {
+        NORMAL = 0x00,
+        STOP   = 0xAA,
+    };
+
+    Control control;  // 0x00=正常/仅控制舵机，0xAA=立即停车
     Pose front;
     Pose turn;
 };
@@ -155,10 +161,10 @@ inline size_t packDetectTask(uint8_t* buf,DetectStatus st,uint8_t left_result,ui
     return packFrame(buf, MsgType::DETECT, payload, sizeof(payload));
 }
 
-// 车身与摄像头控制帧（FF 05 [need_turn][front][turn] DD，共 6 字节）
+// 车身与摄像头控制帧（FF 05 [control][front][turn] DD，共 6 字节）
 inline size_t packBaseControl(uint8_t* buf, const BaseCmdFrame& msg) {
     const uint8_t payload[3] = {
-        static_cast<uint8_t>(msg.need_turn),
+        static_cast<uint8_t>(msg.control),
         static_cast<uint8_t>(msg.front),
         static_cast<uint8_t>(msg.turn),
     };

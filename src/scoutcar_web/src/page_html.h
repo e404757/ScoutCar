@@ -44,6 +44,17 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
     .panel-title { color:#2a7; font-weight:bold; margin-bottom:6px; font-size:13px; }
     .kv { line-height:1.8; color:#ccc; white-space:pre-line; }
     .kv b { color:#eee; }
+    .route-map { width:280px; max-width:90vw; height:auto; display:block; }
+    .map-edge { stroke:#444; stroke-width:3; }
+    .map-route { stroke:#9a9a9a; stroke-width:6; stroke-linecap:round; }
+    .map-route.current { stroke:#ff9d32; }
+    .map-node { fill:#202020; stroke:#aaa; stroke-width:2; }
+    .map-node.current { stroke:#ff9d32; stroke-width:4; }
+    .map-label { fill:#eee; font-size:12px; text-anchor:middle;
+                 dominant-baseline:middle; pointer-events:none; }
+    .map-legend { color:#bbb; font-size:12px; line-height:1.8; }
+    .map-dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+               margin:0 5px 0 10px; }
   </style>
 </head>
 <body>
@@ -94,9 +105,15 @@ static const char * kPageHtml = R"HTML(<!DOCTYPE html>
         <div class="panel-title">道路跟踪参数</div>
         <div id="mi-boundary" class="kv">等待数据…</div>
       </div>
-      <div class="panel-sec">
-        <div class="panel-title">BTP 调试</div>
-        <div id="mi-btp" class="kv">未开启</div>
+    </div>
+    <div id="routepanel" class="panel">
+      <div class="panel-title">路线预览（当前起最多5段）</div>
+      <svg id="route-map" class="route-map" viewBox="0 0 260 330"
+           role="img" aria-label="当前与后续路线段">
+      </svg>
+      <div class="map-legend">
+        <span class="map-dot" style="background:#ff9d32"></span>当前路段
+        <span class="map-dot" style="background:#9a9a9a"></span>后续计划
       </div>
     </div>
   </div>
@@ -185,25 +202,84 @@ function renderInfoPanel() {
       '\n前视参考 x　<b>' + (b.front_reference_x ?? '—') + ' px</b>' +
       '\n转向参考 x　<b>' + (b.turn_reference_x ?? '—') + ' px</b>';
   document.getElementById('mi-boundary').innerHTML = html;
+  renderRouteMap();
+}
 
-  const d = recState.btp_debug || {};
-  const debugStatus = ({0:'正常', 1:'无分割结果', 2:'道路跟踪失败',
-                        3:'推理错误'})[d.status] ?? '未知状态';
-  const btpHtml = !d.active
-    ? '未开启（车身转向始终禁用）'
-    : '方向　<b>' + (d.pose === 2 ? '左侧' : '右侧') + '</b>' +
-      '\n感知　<b>' + (d.online ? debugStatus : '等待转向相机数据') + '</b>' +
-      '\n参考中心　<b>x = ' + (d.reference_x ?? '—') + ' px</b>' +
-      '\n偏差　<b>' + (d.online ? d.deviation : '—') + ' px</b>' +
-      '\n有效范围　<b>' + (d.min_deviation ?? '—') + ' ～ ' +
-        (d.max_deviation ?? '—') + ' px</b>' +
-      '\n连续满足　<b>' + (d.consecutive_frames ?? 0) + ' / ' +
-        (d.required_frames ?? '—') + ' 帧</b>' +
-      '\nBTP 条件　<b style="color:' +
-        (d.condition_met ? '#4d8' : '#e88') + '">' +
-        (d.condition_met ? '满足' : '未满足') + '</b>' +
-      '\n安全状态　<b>仅调试，不触发车身</b>';
-  document.getElementById('mi-btp').innerHTML = btpHtml;
+const routeMapPositions = {
+  1:[130,22], 2:[100,78], 3:[130,78], 4:[160,78],
+  5:[40,134], 6:[100,134], 7:[160,134], 8:[220,134],
+  9:[40,190], 10:[100,190], 11:[160,190], 12:[220,190],
+  13:[40,246], 14:[100,246], 15:[160,246], 16:[220,246],
+  17:[40,302], 18:[100,302], 19:[160,302], 20:[220,302]
+};
+const routeMapEdges = [
+  [1,3],[2,3],[2,6],[3,4],[4,7],
+  [5,6],[5,9],[6,7],[6,10],[7,8],[7,11],[8,12],
+  [9,10],[9,13],[10,11],[10,14],[11,12],[11,15],[12,16],
+  [13,14],[13,17],[14,15],[14,18],[15,16],[15,19],[16,20],
+  [17,18],[18,19],[19,20]
+];
+
+function renderRouteMap() {
+  const svg = document.getElementById('route-map');
+  if (!svg) return;
+  const m = recState.mission || {};
+  const route = Array.isArray(m.route_nodes) ? m.route_nodes : [];
+  const segmentIndex = Number(m.segment_index ?? -1);
+  const routeSegmentIndex =
+    segmentIndex - Number(m.route_segment_offset ?? 0);
+  const waitingToStart = Number(m.mission_state) === 0;
+  const hasCurrentRouteSegment =
+    routeSegmentIndex >= 0 && routeSegmentIndex < route.length - 1;
+  const showPlannedRoute =
+    hasCurrentRouteSegment || waitingToStart || segmentIndex >= 0;
+  const first = hasCurrentRouteSegment
+    ? routeSegmentIndex
+    : (showPlannedRoute ? 0 : route.length);
+  const end = Math.min(route.length - 1, first + 5);
+  const parts = [];
+
+  for (const [a, b] of routeMapEdges) {
+    const p1 = routeMapPositions[a], p2 = routeMapPositions[b];
+    parts.push('<line class="map-edge" x1="' + p1[0] + '" y1="' + p1[1] +
+      '" x2="' + p2[0] + '" y2="' + p2[1] + '"/>');
+  }
+  for (let i = first; i < end; ++i) {
+    const a = Number(route[i]), b = Number(route[i + 1]);
+    const p1 = routeMapPositions[a], p2 = routeMapPositions[b];
+    if (!p1 || !p2 || a === b) continue;
+    if (i === routeSegmentIndex) continue;
+    parts.push('<line class="map-route planned' +
+      '" x1="' + p1[0] + '" y1="' + p1[1] + '" x2="' +
+      p2[0] + '" y2="' + p2[1] + '"/>');
+  }
+  if (hasCurrentRouteSegment && first + 1 < route.length) {
+    const a = Number(route[first]), b = Number(route[first + 1]);
+    const p1 = routeMapPositions[a], p2 = routeMapPositions[b];
+    if (p1 && p2 && a !== b) {
+      parts.push('<line class="map-route current" x1="' + p1[0] +
+        '" y1="' + p1[1] + '" x2="' + p2[0] + '" y2="' + p2[1] + '"/>');
+    }
+  }
+  for (const [node, point] of Object.entries(routeMapPositions)) {
+    const isCurrent = hasCurrentRouteSegment &&
+      Number(node) === Number(route[first]);
+    parts.push('<circle class="map-node ' + (isCurrent ? 'current' : '') +
+      '" cx="' + point[0] + '" cy="' + point[1] + '" r="13"/>');
+    parts.push('<text class="map-label" x="' + point[0] + '" y="' +
+      point[1] + '">' + node + '</text>');
+  }
+  svg.innerHTML = parts.join('');
+  const title = document.querySelector('#routepanel .panel-title');
+  if (title) {
+    title.textContent = hasCurrentRouteSegment
+      ? '路线预览（当前起最多5段）'
+      : (waitingToStart && route.length
+        ? '路线预览（即将执行前5段）'
+        : (showPlannedRoute && route.length
+          ? '路线预览（重规划路径前5段）'
+          : '路线预览（暂无未来路段）'));
+  }
 }
 
 async function toggleRecord() {

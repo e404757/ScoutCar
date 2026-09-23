@@ -26,6 +26,10 @@ CityScout 的 ROS 2 Humble 版本，运行于 Orange Pi 5 Pro（RK3588）。工�
 # 进入工程目录
 cd /home/orangepi/CityScout
 
+# 加载 ROS 2、CityScout 工作空间和 CycloneDDS 环境
+# 必须使用 source；直接执行 ./deploy/env.sh 不会修改当前终端环境
+source deploy/env.sh
+
 # 将 CPU、NPU、GPU 和 DDR 设置为 performance 调频策略
 sudo /home/orangepi/CityScout/deploy/set_performance.sh
 
@@ -43,13 +47,51 @@ colcon build --symlink-install --packages-select scoutcar_bringup
 
 ## 启动
 ```bash
+cd /home/orangepi/CityScout
+source deploy/env.sh
 systemctl stop cityscout-cameras.service
 ros2 launch scoutcar_bringup cityscout.launch.py web:=true
 
 ```
 
+## 固定路线模式
+
+固定路线由 `src/scoutcar_bringup/config/cityscout.yaml` 中的两个参数控制：
+
+```yaml
+mission_node:
+  ros__parameters:
+    route_mode: "fixed"
+    route_nodes: [1, 3, 2, 3, 1]
+```
+
+- `route_mode: "fixed"`：按照 `route_nodes` 执行固定路线。
+- `route_mode: "auto"`：使用原有任务规划器自动生成路线，此时忽略 `route_nodes`。
+- `route_nodes` 只填写依次经过的节点；相邻节点必须在地图上直接连通。
+- 到达动作由相邻三点自动计算，最后一个节点自动停车。
+
+使用配置文件中的固定路线启动整车：
+
+```bash
+cd /home/orangepi/CityScout
+source deploy/env.sh
+ros2 launch scoutcar_bringup cityscout.launch.py web:=true
+```
+
+只启动 mission 节点并临时传入一条固定路线：
+
+```bash
+cd /home/orangepi/CityScout
+source deploy/env.sh
+ros2 run scoutcar_planning mission_node --ros-args \
+  -p route_mode:=fixed \
+  -p 'route_nodes:=[1,3,2,3,1]'
+```
+
+命令行中的 `route_nodes` 只对本次启动有效，不会改写 YAML 配置文件。
+
+sudo systemctl restart rkaiq_3A.service
 pgrep -a -f 'codex|Codex|chatgpt|ChatGPT'
 kill -9 12345
-
 
 

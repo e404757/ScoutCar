@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)#ros2的cmake包
 find_package(rclcpp REQUIRED)#ros2的c++节点库
 find_package(sensor_msgs REQUIRED)#ros2的传感器消息库
+find_package(std_msgs REQUIRED)
 find_package(OpenCV REQUIRED)#opencv库
 
 # 摄像头驱动节点
@@ -17,7 +18,7 @@ add_executable(camera_node
   vendor/camera.cc
 )
 target_include_directories(camera_node PRIVATE vendor)
-ament_target_dependencies(camera_node rclcpp sensor_msgs)
+ament_target_dependencies(camera_node rclcpp sensor_msgs std_msgs)
 target_link_libraries(camera_node ${OpenCV_LIBS})
 
 install(TARGETS camera_node

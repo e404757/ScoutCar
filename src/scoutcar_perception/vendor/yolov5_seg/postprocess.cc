@@ -676,6 +676,12 @@ static int process_fp32(rknn_output *all_input, int input_id, int *anchor, int g
 
 int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, seg_object_detect_result_list *od_results)
 {
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](auto start, auto end) {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    };
+    const auto t0 = Clock::now();
+
     std::vector<float> filterBoxes;
     std::vector<float> objProbs;
     std::vector<int> classId;
@@ -715,10 +721,12 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
                                        classId, conf_threshold, raw_class_score);
         }
     }
+    
 
     // 无论是否为 0，都写回原始每类最高分(供遥测画真实置信度分布)
     for (int k = 0; k < OBJ_CLASS_NUM; ++k)
         od_results->raw_class_score[k] = raw_class_score[k];
+    const auto t_parse = Clock::now();
 
     // 2.nms
     if (validCount <= 0)
@@ -774,7 +782,8 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
         last_count++;
     }
     od_results->count = last_count;
-    int boxes_num = od_results->count;
+    const int boxes_num = od_results->count;
+    const auto t_nms = Clock::now();
 
     //坐标还原
     float filterBoxes_by_nms[boxes_num * 4];
@@ -833,11 +842,13 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
 
     timer.tok();
     timer.print_time("matmul_by_cpu_uint8");
+    const float matmul_ms = timer.get_time();
 
     timer.tik();
     uint8_t *seg_mask = (uint8_t *)malloc(boxes_num * model_in_height * model_in_width * sizeof(uint8_t));
     resize_by_opencv_uint8(matmul_out, PROTO_WEIGHT, PROTO_HEIGHT, boxes_num, seg_mask, model_in_width, model_in_height);
     timer.tok();
+    const float resize_ms = timer.get_time();
     timer.print_time("resize_by_opencv_uint8");
 
     timer.tik();
@@ -846,7 +857,10 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     memset(all_mask_in_one, 0, model_in_height * model_in_width * sizeof(uint8_t));
     crop_mask_uint8(seg_mask, all_mask_in_one, filterBoxes_by_nms, boxes_num, cls_id, model_in_height, model_in_width);
     timer.tok();
+    const float crop_ms = timer.get_time();
     timer.print_time("crop_mask_uint8");
+    printf("Seg mask: boxes=%d matmul=%.2f resize=%.2f crop=%.2f ms\n",
+           boxes_num, matmul_ms, resize_ms, crop_ms);
 #endif
 
     timer.tik();
@@ -854,6 +868,7 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     int ori_in_height = app_ctx->input_image_height;
     int ori_in_width = app_ctx->input_image_width;
     uint8_t *real_seg_mask = (uint8_t *)malloc(ori_in_height * ori_in_width * sizeof(uint8_t));
+    const auto t_mask = Clock::now();
     seg_reverse(all_mask_in_one, real_seg_mask,
                 model_in_height, model_in_width, ori_in_height, ori_in_width, letter_box->y_pad);
     od_results->results_seg[0].seg_mask = real_seg_mask;
@@ -862,6 +877,12 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     free(matmul_out);
     timer.tok();
     timer.print_time("seg_reverse");
+    const auto t_end = Clock::now();
+
+    // printf("Seg post: valid=%d boxes=%d parse=%.2f nms=%.2f mask=%.2f reverse=%.2f ms\n",
+    //     validCount, boxes_num,
+    //     ms(t0, t_parse), ms(t_parse, t_nms),
+    //     ms(t_nms, t_mask), ms(t_mask, t_end));
 
     return 0;
 }

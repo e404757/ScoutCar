@@ -5,16 +5,20 @@ front_camera_node:
     image_width: 640
     image_height: 480
     image_topic: "/camera/front/image_raw"
+    health_topic: "/camera/front/healthy"
     prefer_mipi: true
+    rotate_180: false
     
 turn_camera_node:
   ros__parameters:
-    camera_path: "/dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0"
+    camera_path: "/dev/video22"
     fps: 30
     image_width: 640
     image_height: 480
     image_topic: "/camera/turn/image_raw"
-    prefer_mipi: false
+    health_topic: "/camera/turn/healthy"
+    prefer_mipi: true
+    rotate_180: true
 
 perception_node:
   ros__parameters:
@@ -38,13 +42,6 @@ perception_node:
     road_tracking.turn_left_reference_x: 355
     road_tracking.turn_right_reference_x: 291
 
-    btp.left.max_deviation: 40
-    btp.left.min_deviation: 20
-    btp.left.required_consecutive_frames: 1
-    btp.right.max_deviation: -30
-    btp.right.min_deviation: -50
-    btp.right.required_consecutive_frames: 1
-
     detect.confidence_threshold: 0.8
     detect.nms_threshold: 0.45
 
@@ -54,7 +51,10 @@ mission_node:
     turn_penalty: 0.5
     u_turn_penalty: 1.0
     tunnel_risk: 0.0
-    obstacle_mode: "bidirectional"
+    route_mode: "auto"
+    route_nodes: [
+      1,3,2,6,7,11,10,14,15,19,18,14,15,11,10,6,7,8,12,11,7,6,5,9,10,14,15,11,12,16,15,14,10,9,13,14,18,19,20,16,15,11,10,6,7,4,3,1
+    ]
 
 serial_node:
   ros__parameters:

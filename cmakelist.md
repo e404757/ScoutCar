@@ -40,7 +40,6 @@ project(工程名)
 ```cmake
 find_package(依赖名 REQUIRED)
 ```
-
 - `REQUIRED`：找不到这个依赖就停止构建并报错。
 - `find_package` 只是“找到依赖”；后面还要让具体程序使用它。
 

@@ -14,12 +14,11 @@ web_node:
     bag_dir: /home/orangepi/CityScout/data/bags
     bag_topics:
       - /perception/road_deviation
-      - /perception/is_btp
       - /mission/mission_state
       - /mission/base_cmd
       - /mission/path_cmd
       - /mission/detect_task
-      - /perception/detect_results
+      - /perception/recon_result
       - /mcu/rx_event
       - /obstacle/event
     jpg_quality: 85

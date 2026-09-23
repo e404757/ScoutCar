@@ -22,6 +22,7 @@
 - 处理器平台：Rockchip RK3588。
 - 项目类型：面向特定机器人和特定任务，不是通用机器人框架。
 - 本地已配置 ROS 2 和 RKNN Toolkit 2 等开发环境。
+- 使用 `colcon build` 构建本项目时，命令必须带 `--symlink-install`。例如构建感知包：`colcon build --symlink-install --packages-select scoutcar_perception`。
 - 项目相关备份统一存放在 `/home/orangepi/CityScout/backup` 目录中。
 - 香橙派作为上位机，通过串口与 STM32 下位机通信。
 - STM32 主要负责底层运动控制，香橙派主要负责上层运动决策。

@@ -299,6 +299,14 @@ out:
 // 避免 RGA importbuffer_virtualaddr 对非 RGA 兼容内存崩溃。模型与后处理完全复用。
 int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer_t *img, seg_object_detect_result_list *od_results)
 {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point t_pre_begin, t_pre_end;
+    Clock::time_point t_input_end, t_run_end;
+    Clock::time_point t_output_end, t_post_end;
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+};
+
     int ret;
     image_buffer_t dst_img;
     letterbox_t letter_box;
@@ -327,6 +335,7 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
     }
 
     // Pre Process (CPU)
+    t_pre_begin = Clock::now();
     app_ctx->input_image_width = img->width;
     app_ctx->input_image_height = img->height;
     dst_img.width = app_ctx->model_width;
@@ -363,15 +372,17 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
     inputs[0].size = app_ctx->model_width * app_ctx->model_height * app_ctx->model_channel;
     inputs[0].buf = dst_img.virt_addr;
 
+    t_pre_end = Clock::now();
     ret = rknn_inputs_set(app_ctx->rknn_ctx, app_ctx->io_num.n_input, inputs);
+    t_input_end = Clock::now();
     if (ret < 0)
     {
         printf("rknn_input_set fail! ret=%d\n", ret);
         goto out;
     }
-
     // Run
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
+    t_run_end = Clock::now();
     if (ret < 0)
     {
         printf("rknn_run fail! ret=%d\n", ret);
@@ -395,6 +406,7 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
         outputs[i].want_float = (!app_ctx->is_quant);  // int8 模型取原始 int8（process_i8 反量化），fp16 取 float32
     }
     ret = rknn_outputs_get(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs, NULL);
+    t_output_end = Clock::now();
     if (ret < 0)
     {
         printf("rknn_outputs_get fail! ret=%d\n", ret);
@@ -403,8 +415,14 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
 
     // Post Process
     seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
-
-    rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
+    t_post_end = Clock::now();
+    // printf("Seg detail: pre=%.2f input=%.2f run=%.2f output=%.2f post=%.2f ms\n",
+    //    ms(t_pre_begin, t_pre_end),
+    //    ms(t_pre_end, t_input_end),
+    //    ms(t_input_end, t_run_end),
+    //    ms(t_run_end, t_output_end),
+    //    ms(t_output_end, t_post_end));
+    // rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
 out:
     if (dst_img.virt_addr != NULL)

@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <opencv2/opencv.hpp>
 
@@ -12,10 +13,8 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <scoutcar_msgs/msg/road_deviation.hpp>
-#include <scoutcar_msgs/msg/detect_task.hpp>
-#include <scoutcar_msgs/msg/btp_debug.hpp>
+#include <scoutcar_msgs/msg/recon_result.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <scoutcar_msgs/msg/car_state.hpp>
@@ -25,13 +24,22 @@
 #include "scoutcar_perception/segmentation_model.hpp"
 #include "scoutcar_perception/yolov8_model.hpp"
 
-class PerceptionNode : public rclcpp::Node {
-  struct BtpConfig {
-    int max_deviation = 20;
-    int min_deviation = -20;
-    int required_consecutive_frames = 3;
-  };
+namespace {
 
+constexpr float kReconConfidenceThreshold = 0.9F;
+constexpr int kReconRequiredFrames = 3;
+
+struct ReconSideLock {
+  int candidate_class = -1;
+  int consecutive_frames = 0;
+  bool locked = false;
+  uint8_t result = 0;
+  float confidence = 0.0F;
+};
+
+}  // namespace
+
+class PerceptionNode : public rclcpp::Node {
 public:
   PerceptionNode() : Node("perception_node") {
 
@@ -102,18 +110,6 @@ public:
         declare_parameter<int>("road_tracking.turn_left_reference_x", 320);
     turn_right_reference_x_ =
         declare_parameter<int>("road_tracking.turn_right_reference_x", 320);
-    left_btp_config_.max_deviation =
-        declare_parameter<int>("btp.left.max_deviation", 20);
-    left_btp_config_.min_deviation =
-        declare_parameter<int>("btp.left.min_deviation", -20);
-    left_btp_config_.required_consecutive_frames =
-        declare_parameter<int>("btp.left.required_consecutive_frames", 3);
-    right_btp_config_.max_deviation =
-        declare_parameter<int>("btp.right.max_deviation", 20);
-    right_btp_config_.min_deviation =
-        declare_parameter<int>("btp.right.min_deviation", -20);
-    right_btp_config_.required_consecutive_frames =
-        declare_parameter<int>("btp.right.required_consecutive_frames", 3);
     road_tracker_ =
         std::make_unique<road_tracking::RoadTracker>(tracking_config);
 
@@ -130,12 +126,8 @@ public:
         "perception/front_detection_image", debug_qos);
     pub_turn_detection_ = create_publisher<sensor_msgs::msg::Image>(
         "perception/turn_detection_image", debug_qos);
-    pub_detect_results_ = create_publisher<scoutcar_msgs::msg::DetectTask>(
-      "perception/detect_results",10);
-    pub_is_btp_ = create_publisher<std_msgs::msg::Empty>(
-        "perception/is_btp", 10);
-    pub_btp_debug_ = create_publisher<scoutcar_msgs::msg::BtpDebug>(
-        "perception/btp_debug", 10);
+    pub_recon_result_ = create_publisher<scoutcar_msgs::msg::ReconResult>(
+      "perception/recon_result", 10);
     const auto status_qos =
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_btp_debug_cmd_ = create_subscription<std_msgs::msg::UInt8>(
@@ -145,11 +137,6 @@ public:
               msg->data == scoutcar_msgs::msg::CarState::DIRECTION_LEFT ||
               msg->data == scoutcar_msgs::msg::CarState::DIRECTION_RIGHT;
           btp_debug_pose_ = active ? msg->data : 0;
-          btp_debug_match_count_ = 0;
-          const std_msgs::msg::Header empty_header;
-          publish_btp_debug_state(empty_header,
-              scoutcar_msgs::msg::RoadDeviation::STATUS_TRACKING_FAILED,
-              nullptr);
           RCLCPP_INFO(get_logger(), "BTP 调试%s，转向相机姿态=%u",
                       active ? "开启" : "关闭",
                       static_cast<unsigned>(btp_debug_pose_));
@@ -157,10 +144,24 @@ public:
     sub_mission_state_ = create_subscription<scoutcar_msgs::msg::CarState>(
         "mission/mission_state", status_qos,
         [this](const scoutcar_msgs::msg::CarState::SharedPtr msg) {
-          if (msg->mission_state != mission_state_) {
-            btp_match_count_ = 0;
-            btp_request_sent_ = false;
+          const bool cameras_look_opposite =
+              (msg->front_camera_pose ==
+                 scoutcar_msgs::msg::CarState::DIRECTION_LEFT &&
+               msg->turn_camera_pose ==
+                 scoutcar_msgs::msg::CarState::DIRECTION_RIGHT) ||
+              (msg->front_camera_pose ==
+                 scoutcar_msgs::msg::CarState::DIRECTION_RIGHT &&
+               msg->turn_camera_pose ==
+                 scoutcar_msgs::msg::CarState::DIRECTION_LEFT);
+          const bool next_detect_active =
+              msg->mission_state == scoutcar_msgs::msg::CarState::DETECTING &&
+              cameras_look_opposite;
+          if (!detect_active_ && next_detect_active) {
+            reset_recon_result();
+          } else if (detect_active_ && !next_detect_active) {
+            publish_recon_result();
           }
+          detect_active_ = next_detect_active;
           mission_state_ = msg->mission_state;
           turn_camera_pose_ = msg->turn_camera_pose;
         });
@@ -169,13 +170,13 @@ public:
         rclcpp::QoS(1)
             .best_effort(), // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
         [this](const sensor_msgs::msg::Image::SharedPtr msg) {
-          if (mission_state_ == scoutcar_msgs::msg::CarState::DETECTING) {
-            process_Detectframe(msg, pub_turn_detection_, "转向相机");
+          if (detect_active_) {
+            process_Detectframe(msg, pub_turn_detection_, "转向相机", false);
           } else if (mission_state_ ==
                      scoutcar_msgs::msg::CarState::FINDING_BTP) {
             process_Segframe(msg, true);
           } else if (btp_debug_pose_ != 0) {
-            process_Segframe(msg, true, true);
+            process_Segframe(msg, true, false);
           }
         });
     sub_front_image_ = create_subscription<sensor_msgs::msg::Image>(
@@ -183,8 +184,8 @@ public:
         rclcpp::QoS(1)
             .best_effort(), // 与 camera_node 的 QoS 匹配；depth=1 只留最新帧
         [this](const sensor_msgs::msg::Image::SharedPtr msg) {
-          if (mission_state_ == scoutcar_msgs::msg::CarState::DETECTING) {
-            process_Detectframe(msg, pub_front_detection_, "前视相机");
+          if (detect_active_) {
+            process_Detectframe(msg, pub_front_detection_, "前视相机", true);
           } else if (btp_debug_pose_ != 0) {
             
           } else if (
@@ -194,21 +195,7 @@ public:
             const bool publish_control_deviation =
                 mission_state_ != scoutcar_msgs::msg::CarState::TURNING;
             process_Segframe(
-                msg, false, false, publish_control_deviation);
-          }
-        });
-    sub_detect_task_ = create_subscription<scoutcar_msgs::msg::DetectTask>(
-        "/mission/detect_task", status_qos,
-        [this](const scoutcar_msgs::msg::DetectTask::SharedPtr msg) {
-          if (msg->status == scoutcar_msgs::msg::DetectTask::START) {
-            detect_status_ = true;
-            RCLCPP_INFO(get_logger(), "侦察开始，切换到两路YOLOv8检测");
-          } else if (msg->status == scoutcar_msgs::msg::DetectTask::END) {
-            detect_status_ = false;
-            RCLCPP_INFO(get_logger(), "侦察结束，恢复Seg感知");
-          } else {
-            RCLCPP_WARN(get_logger(), "忽略未知侦察状态: 0x%02X",
-                        msg->status);
+                msg, false, publish_control_deviation);
           }
         });
   }
@@ -293,7 +280,7 @@ private:
   }
 
   void process_Segframe(const sensor_msgs::msg::Image::SharedPtr msg,
-                        bool use_turn_camera, bool btp_debug = false,
+                        bool use_turn_camera,
                         bool publish_control_deviation = true) {
     const bool make_debug = should_make_debug();
     const uint8_t active_turn_pose =
@@ -311,22 +298,17 @@ private:
             : (use_right_turn_ipm ? turn_right_ipm_inverse_
                                   : turn_left_ipm_inverse_);
 
-    auto seg_result = segmentation_model_->infer(msg->data.data(),
-                                                 static_cast<int>(msg->width),
-                                                 static_cast<int>(msg->height));
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+
+    auto seg_result = segmentation_model_->infer(
+        msg->data.data(), static_cast<int>(msg->width),
+        static_cast<int>(msg->height));
+    const auto t1 = Clock::now();
+
     if (!seg_result.error.empty()) {
       RCLCPP_ERROR(get_logger(), "Seg推理失败: %s", seg_result.error.c_str());
-      if (use_turn_camera) {
-        if (btp_debug) {
-          btp_debug_match_count_ = 0;
-          publish_btp_debug_state(
-              msg->header,
-              scoutcar_msgs::msg::RoadDeviation::STATUS_INFERENCE_ERROR,
-              nullptr);
-        } else {
-          btp_match_count_ = 0;
-        }
-      } else if (publish_control_deviation) {
+      if (publish_control_deviation) {
         publish_deviation(
             msg->header,
             scoutcar_msgs::msg::RoadDeviation::STATUS_INFERENCE_ERROR);
@@ -339,17 +321,7 @@ private:
       return;
     }
     if (!seg_result.valid) {
-      if (use_turn_camera) {
-        if (btp_debug) {
-          btp_debug_match_count_ = 0;
-          publish_btp_debug_state(
-              msg->header,
-              scoutcar_msgs::msg::RoadDeviation::STATUS_NO_SEGMENTATION,
-              nullptr);
-        } else {
-          btp_match_count_ = 0;
-        }
-      } else if (publish_control_deviation) {
+      if (publish_control_deviation) {
         publish_deviation(
             msg->header,
             scoutcar_msgs::msg::RoadDeviation::STATUS_NO_SEGMENTATION);
@@ -371,6 +343,7 @@ private:
                                   : turn_left_ipm_matrix_);
     cv::warpPerspective(source_mask, ipm_mask, ipm_matrix, source_mask.size(),
                         cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    const auto t2 = Clock::now(); 
 
     const int reference_x =
         std::clamp(configured_reference_x, 0, seg_result.width - 1);
@@ -382,29 +355,13 @@ private:
     const auto result = road_tracker_->process(
         ipm_mask.data, seg_result.width, seg_result.height, reference_x,
         make_debug ? selected_mask.data() : nullptr);
-
+    const auto t3 = Clock::now();  
 
     if (!result.valid) {
-      if (use_turn_camera) {
-        if (btp_debug) {
-          btp_debug_match_count_ = 0;
-          publish_btp_debug_state(
-              msg->header,
-              scoutcar_msgs::msg::RoadDeviation::STATUS_TRACKING_FAILED,
-              nullptr);
-        } else {
-          btp_match_count_ = 0;
-        }
-      } else if (publish_control_deviation) {
+      if (publish_control_deviation) {
         publish_deviation(
             msg->header,
             scoutcar_msgs::msg::RoadDeviation::STATUS_TRACKING_FAILED);
-      }
-    } else if (use_turn_camera) {
-      if (btp_debug) {
-        update_btp_debug_state(msg->header, result);
-      } else {
-        update_btp_state(result);
       }
     } else if (publish_control_deviation) {
       publish_deviation(msg->header,
@@ -417,43 +374,16 @@ private:
                            selected_mask.data(), result, reference_x,
                            ipm_inverse);
     }
-  }
-
-  void update_btp_state(const road_tracking::Result &result) {
-    if (btp_request_sent_) {
-      return;
-    }
-
-    const BtpConfig &config = activeBtpConfig();
-    if (result.deviation <= config.max_deviation &&
-        result.deviation >= config.min_deviation) {
-      ++btp_match_count_;
-    } else {
-      btp_match_count_ = 0;
-    }
-
-    if (btp_match_count_ < config.required_consecutive_frames) {
-      return;
-    }
-
-    pub_is_btp_->publish(std_msgs::msg::Empty{});
-    btp_request_sent_ = true;
-    RCLCPP_INFO(
-        get_logger(), "转向相机连续 %d 帧满足 BTP 条件，当前偏差=%d px",
-        btp_match_count_, result.deviation);
-  }
-
-  void update_btp_debug_state(const std_msgs::msg::Header &header,
-                              const road_tracking::Result &result) {
-    const BtpConfig &config = activeBtpConfig();
-    if (result.deviation <= config.max_deviation &&
-        result.deviation >= config.min_deviation) {
-      ++btp_debug_match_count_;
-    } else {
-      btp_debug_match_count_ = 0;
-    }
-    publish_btp_debug_state(
-        header, scoutcar_msgs::msg::RoadDeviation::STATUS_OK, &result);
+    const auto t4 = Clock::now();
+    RCLCPP_INFO_THROTTLE(
+    get_logger(), *get_clock(), 2000,
+    "Seg %s: infer=%.2f ipm=%.2f track=%.2f publish=%.2f total=%.2f ms",
+    use_turn_camera ? "turn" : "front",
+    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+    std::chrono::duration<double, std::milli>(t2 - t1).count(),
+    std::chrono::duration<double, std::milli>(t3 - t2).count(),
+    std::chrono::duration<double, std::milli>(t4 - t3).count(),
+    std::chrono::duration<double, std::milli>(t4 - t0).count());  
   }
 
   int activeTurnReferenceX() const {
@@ -464,43 +394,11 @@ private:
                : turn_left_reference_x_;
   }
 
-  const BtpConfig &activeBtpConfig() const {
-    const uint8_t pose =
-        btp_debug_pose_ != 0 ? btp_debug_pose_ : turn_camera_pose_;
-    return pose == scoutcar_msgs::msg::CarState::DIRECTION_RIGHT
-               ? right_btp_config_
-               : left_btp_config_;
-  }
-
-  void publish_btp_debug_state(
-      const std_msgs::msg::Header &header, uint8_t status,
-      const road_tracking::Result *result) {
-    scoutcar_msgs::msg::BtpDebug debug{};
-    debug.header = header;
-    debug.active = btp_debug_pose_ != 0;
-    debug.camera_pose = btp_debug_pose_;
-    debug.status = status;
-    debug.deviation = result == nullptr
-                          ? 0
-                          : static_cast<int16_t>(result->deviation);
-    debug.reference_x = activeTurnReferenceX();
-    const BtpConfig &config = activeBtpConfig();
-    debug.min_deviation = static_cast<int16_t>(config.min_deviation);
-    debug.max_deviation = static_cast<int16_t>(config.max_deviation);
-    debug.consecutive_frames =
-        static_cast<uint16_t>(std::max(0, btp_debug_match_count_));
-    debug.required_frames = static_cast<uint16_t>(
-        std::max(0, config.required_consecutive_frames));
-    debug.condition_met =
-        config.required_consecutive_frames > 0 &&
-        btp_debug_match_count_ >= config.required_consecutive_frames;
-    pub_btp_debug_->publish(debug);
-  }
-
   void process_Detectframe(
       const sensor_msgs::msg::Image::SharedPtr msg,
       const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr &publisher,
-      const char *camera_name) {
+      const char *camera_name,
+      bool is_left) {
     const int width = static_cast<int>(msg->width);
     const int height = static_cast<int>(msg->height);
     const size_t row_bytes = static_cast<size_t>(width) * 3U;
@@ -531,6 +429,9 @@ private:
                             "%s YOLOv8推理失败: %s", camera_name,
                             detection_result.error.c_str());
     } else {
+      update_recon_lock(
+          is_left ? left_recon_lock_ : right_recon_lock_,
+          detection_result, camera_name);
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                            "%s YOLOv8检测到 %zu 个目标", camera_name,
                            detection_result.detections.size());
@@ -546,6 +447,64 @@ private:
                      error.what());
       }
     }
+  }
+
+  void reset_recon_result() {
+    left_recon_lock_ = ReconSideLock{};
+    right_recon_lock_ = ReconSideLock{};
+    RCLCPP_INFO(get_logger(), "侦察结果累计已清空");
+  }
+
+  void update_recon_lock(
+      ReconSideLock &side,
+      const scoutcar_perception::DetectionResult &detection_result,
+      const char *camera_name) {
+    if (side.locked) {
+      return;
+    }
+
+    if (detection_result.detections.empty() ||
+        detection_result.detections.front().confidence <
+          kReconConfidenceThreshold) {
+      side.candidate_class = -1;
+      side.consecutive_frames = 0;
+      return;
+    }
+
+    const auto &detection = detection_result.detections.front();
+    if (side.candidate_class == detection.class_id) {
+      ++side.consecutive_frames;
+    } else {
+      side.candidate_class = detection.class_id;
+      side.consecutive_frames = 1;
+    }
+
+    if (side.consecutive_frames < kReconRequiredFrames) {
+      return;
+    }
+
+    side.locked = true;
+    side.result = static_cast<uint8_t>(detection.class_id + 1);
+    side.confidence = detection.confidence;
+    RCLCPP_INFO(
+      get_logger(), "%s侦察结果锁定：类别=%u 置信度=%.3f",
+      camera_name, static_cast<unsigned>(side.result), side.confidence);
+  }
+
+  void publish_recon_result() {
+    scoutcar_msgs::msg::ReconResult result;
+    result.header.stamp = now();
+    result.left_valid = left_recon_lock_.locked;
+    result.left_result = left_recon_lock_.result;
+    result.left_confidence = left_recon_lock_.confidence;
+    result.right_valid = right_recon_lock_.locked;
+    result.right_result = right_recon_lock_.result;
+    result.right_confidence = right_recon_lock_.confidence;
+    pub_recon_result_->publish(result);
+    RCLCPP_INFO(
+      get_logger(), "侦察结果发布：左(valid=%d result=%u) 右(valid=%d result=%u)",
+      result.left_valid, static_cast<unsigned>(result.left_result),
+      result.right_valid, static_cast<unsigned>(result.right_result));
   }
 
   void publish_deviation(
@@ -586,8 +545,6 @@ private:
   double detect_confidence_threshold_ = 0.25;
   double detect_nms_threshold_ = 0.45;
   bool enable_turning_inference_ = false;
-  std::string front_image_topic_;
-  std::string turn_image_topic_;
   std::unique_ptr<road_tracking::RoadTracker> road_tracker_;
   std::unique_ptr<scoutcar_perception::SegmentationModel> segmentation_model_;
   scoutcar_perception::PerceptionVisualizer visualizer_;
@@ -601,29 +558,23 @@ private:
   int front_reference_x_ = 320;
   int turn_left_reference_x_ = 320;
   int turn_right_reference_x_ = 320;
-  BtpConfig left_btp_config_;
-  BtpConfig right_btp_config_;
-  int btp_match_count_ = 0;
-  bool btp_request_sent_ = false;
   uint8_t btp_debug_pose_ = 0;
-  int btp_debug_match_count_ = 0;
   uint8_t mission_state_ = scoutcar_msgs::msg::CarState::FINISHED;
   uint8_t turn_camera_pose_ = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
-  bool detect_status_ = false;
+  bool detect_active_ = false;
+  ReconSideLock left_recon_lock_;
+  ReconSideLock right_recon_lock_;
 
   rclcpp::Subscription<scoutcar_msgs::msg::CarState>::SharedPtr sub_mission_state_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr sub_btp_debug_cmd_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_front_image_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_turn_image_;
-  rclcpp::Subscription<scoutcar_msgs::msg::DetectTask>::SharedPtr sub_detect_task_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_mask_debug_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_ipm_debug_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_front_detection_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_turn_detection_;
-  rclcpp::Publisher<scoutcar_msgs::msg::DetectTask>::SharedPtr pub_detect_results_;
+  rclcpp::Publisher<scoutcar_msgs::msg::ReconResult>::SharedPtr pub_recon_result_;
   rclcpp::Publisher<scoutcar_msgs::msg::RoadDeviation>::SharedPtr pub_deviation_;
-  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr pub_is_btp_;
-  rclcpp::Publisher<scoutcar_msgs::msg::BtpDebug>::SharedPtr pub_btp_debug_;
 };
 
 int main(int argc, char **argv) {
