@@ -281,7 +281,7 @@ int inference_yolov5_seg_model(seg_rknn_app_context_t *app_ctx, image_buffer_t *
     }
 
     // Post Process
-    seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
+    ret = seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
 
     rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
@@ -414,7 +414,7 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
     }
 
     // Post Process
-    seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
+    ret = seg_post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
     t_post_end = Clock::now();
     // printf("Seg detail: pre=%.2f input=%.2f run=%.2f output=%.2f post=%.2f ms\n",
     //    ms(t_pre_begin, t_pre_end),
@@ -422,7 +422,7 @@ int inference_yolov5_seg_model_cpu(seg_rknn_app_context_t *app_ctx, image_buffer
     //    ms(t_input_end, t_run_end),
     //    ms(t_run_end, t_output_end),
     //    ms(t_output_end, t_post_end));
-    // rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
+    rknn_outputs_release(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs);
 
 out:
     if (dst_img.virt_addr != NULL)

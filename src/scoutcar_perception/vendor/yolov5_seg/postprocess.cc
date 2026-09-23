@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <opencv2/opencv.hpp>
+#include <arm_neon.h>
 #include "rknn_matmul_api.h"//调用 NPU 做矩阵乘法，加速 Mask 生成。
 #include "im2d.hpp"
 #include "dma_alloc.hpp"
@@ -15,6 +16,7 @@
 #include "Float16.h"
 #include "easy_timer.h"
 
+#include <chrono>
 #include <set>
 #include <vector>
 // #define USE_FP_RESIZE 0
@@ -434,6 +436,133 @@ void matmul_by_npu_fp(std::vector<float> &A_input, float *B_input, float *C_inpu
     rknn_matmul_destroy(ctx);
 }
 
+// 复用 matmul 上下文；框数增大时才扩容，避免每帧重复创建 NPU 内存。
+struct SegMaskMatmul {
+    rknn_matmul_ctx ctx = 0;
+    rknn_matmul_io_attr attr{};
+    rknn_tensor_mem *a = nullptr;
+    rknn_tensor_mem *b = nullptr;
+    rknn_tensor_mem *c = nullptr;
+    int capacity = 0;
+};
+
+static SegMaskMatmul mask_matmul;
+
+// RK3588 的 FP16 指令只用于输入转换，其余后处理仍用原有编译配置。
+__attribute__((target("arch=armv8.2-a+fp16"), optimize("O3")))
+static void convert_mask_input_fp16(const float *src, void *dst_data, int count)
+{
+    auto *dst = static_cast<__fp16 *>(dst_data);
+    int i = 0;
+    for (; i + 4 <= count; i += 4) {
+        vst1_f16(dst + i, vcvt_f16_f32(vld1q_f32(src + i)));
+    }
+    for (; i < count; ++i) dst[i] = src[i];
+}
+
+struct SegMaskMatmulTiming {
+    double setup_ms = 0;
+    double convert_ms = 0;
+    double bind_ms = 0;
+    double sync_in_ms = 0;
+    double run_ms = 0;
+    double sync_out_ms = 0;
+    double binary_ms = 0;
+};
+
+static void release_mask_matmul()
+{
+    if (mask_matmul.a) rknn_destroy_mem(mask_matmul.ctx, mask_matmul.a);
+    if (mask_matmul.b) rknn_destroy_mem(mask_matmul.ctx, mask_matmul.b);
+    if (mask_matmul.c) rknn_destroy_mem(mask_matmul.ctx, mask_matmul.c);
+    if (mask_matmul.ctx) rknn_matmul_destroy(mask_matmul.ctx);
+    mask_matmul = SegMaskMatmul{};
+}
+
+static int matmul_by_npu_uint8(const std::vector<float> &coefficients,
+                              const float *proto, uint8_t *mask,
+                              int boxes_num, SegMaskMatmulTiming *timing)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const auto t_start = Clock::now();
+    constexpr int k = PROTO_CHANNEL;
+    constexpr int n = PROTO_HEIGHT * PROTO_WEIGHT;
+    bool created = false;
+    if (boxes_num > mask_matmul.capacity) {
+        release_mask_matmul();
+        rknn_matmul_info info{};
+        info.M = boxes_num;
+        info.K = k;
+        info.N = n;
+        info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+        int ret = rknn_matmul_create(&mask_matmul.ctx, &info, &mask_matmul.attr);
+        if (ret != RKNN_SUCC) {
+            release_mask_matmul();
+            return ret;
+        }
+        ret = rknn_matmul_set_core_mask(mask_matmul.ctx, RKNN_NPU_CORE_2);
+        if (ret != RKNN_SUCC) {
+            release_mask_matmul();
+            return ret;
+        }
+        mask_matmul.a = rknn_create_mem(mask_matmul.ctx, mask_matmul.attr.A.size);
+        mask_matmul.b = rknn_create_mem(mask_matmul.ctx, mask_matmul.attr.B.size);
+        mask_matmul.c = rknn_create_mem(mask_matmul.ctx, mask_matmul.attr.C.size);
+        if (!mask_matmul.a || !mask_matmul.b || !mask_matmul.c) {
+            release_mask_matmul();
+            return -1;
+        }
+        mask_matmul.capacity = boxes_num;
+        created = true;
+    }
+
+    const auto t_setup = Clock::now();
+    convert_mask_input_fp16(coefficients.data(), mask_matmul.a->virt_addr,
+                            boxes_num * k);
+    auto *a = static_cast<__fp16 *>(mask_matmul.a->virt_addr);
+    for (int i = boxes_num * k; i < mask_matmul.capacity * k; ++i) a[i] = 0.0f;
+    convert_mask_input_fp16(proto, mask_matmul.b->virt_addr, k * n);
+    const auto t_convert = Clock::now();
+
+    // B 在绑定时被 runtime 处理；每帧更新 proto 后必须重新绑定 B。
+    int bind_ret = RKNN_SUCC;
+    if (created) bind_ret = rknn_matmul_set_io_mem(mask_matmul.ctx, mask_matmul.a, &mask_matmul.attr.A);
+    if (bind_ret == RKNN_SUCC) bind_ret = rknn_matmul_set_io_mem(mask_matmul.ctx, mask_matmul.b, &mask_matmul.attr.B);
+    if (created && bind_ret == RKNN_SUCC) bind_ret = rknn_matmul_set_io_mem(mask_matmul.ctx, mask_matmul.c, &mask_matmul.attr.C);
+    if (bind_ret != RKNN_SUCC) {
+        release_mask_matmul();
+        return bind_ret;
+    }
+
+    const auto t_bind = Clock::now();
+    int ret = rknn_mem_sync(mask_matmul.ctx, mask_matmul.a, RKNN_MEMORY_SYNC_TO_DEVICE);
+    if (ret != RKNN_SUCC) return ret;
+    ret = rknn_mem_sync(mask_matmul.ctx, mask_matmul.b, RKNN_MEMORY_SYNC_TO_DEVICE);
+    if (ret != RKNN_SUCC) return ret;
+    const auto t_sync_in = Clock::now();
+    ret = rknn_matmul_run(mask_matmul.ctx);
+    if (ret != RKNN_SUCC) return ret;
+    const auto t_run = Clock::now();
+    ret = rknn_mem_sync(mask_matmul.ctx, mask_matmul.c, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    if (ret != RKNN_SUCC) return ret;
+    const auto t_sync_out = Clock::now();
+
+    const auto *c = static_cast<const float *>(mask_matmul.c->virt_addr);
+    for (int i = 0; i < boxes_num * n; ++i) mask[i] = c[i] > 0.0f ? 4 : 0;
+    const auto t_end = Clock::now();
+    timing->setup_ms = ms(t_start, t_setup);
+    timing->convert_ms = ms(t_setup, t_convert);
+    timing->bind_ms = ms(t_convert, t_bind);
+    timing->sync_in_ms = ms(t_bind, t_sync_in);
+    timing->run_ms = ms(t_sync_in, t_run);
+    timing->sync_out_ms = ms(t_run, t_sync_out);
+    timing->binary_ms = ms(t_sync_out, t_end);
+    return 0;
+}
+
 //掩膜坐标还原
 void seg_reverse(uint8_t *seg_mask, uint8_t *seg_mask_real,
                  int model_in_height, int model_in_width, int ori_in_height, int ori_in_width, int crop_top)
@@ -833,15 +962,19 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     timer.print_time("crop_mask_fp");
 #else
     timer.tik();
-    // compute the mask through Matmul
-    int ROWS_A = boxes_num;
-    int COLS_A = PROTO_CHANNEL;
-    int COLS_B = PROTO_HEIGHT * PROTO_WEIGHT;
+    // 只在 NPU 上计算矩阵，保持后续 uint8 resize/crop 路径不变。
     uint8_t *matmul_out = (uint8_t *)malloc(boxes_num * PROTO_HEIGHT * PROTO_WEIGHT * sizeof(uint8_t));
-    matmul_by_cpu_uint8(filterSegments_by_nms, proto, matmul_out, ROWS_A, COLS_A, COLS_B);
+    SegMaskMatmulTiming matmul_timing;
+    const int matmul_ret = matmul_by_npu_uint8(filterSegments_by_nms, proto,
+                                               matmul_out, boxes_num,
+                                               &matmul_timing);
+    if (matmul_ret != 0) {
+        free(matmul_out);
+        return matmul_ret;
+    }
 
     timer.tok();
-    timer.print_time("matmul_by_cpu_uint8");
+    timer.print_time("matmul_by_npu_uint8");
     const float matmul_ms = timer.get_time();
 
     timer.tik();
@@ -859,8 +992,12 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     timer.tok();
     const float crop_ms = timer.get_time();
     timer.print_time("crop_mask_uint8");
-    printf("Seg mask: boxes=%d matmul=%.2f resize=%.2f crop=%.2f ms\n",
-           boxes_num, matmul_ms, resize_ms, crop_ms);
+    printf("Seg mask: boxes=%d matmul=%.2f (setup=%.2f convert=%.2f bind=%.2f sync_in=%.2f run=%.2f sync_out=%.2f binary=%.2f) resize=%.2f crop=%.2f ms\n",
+           boxes_num, matmul_ms, matmul_timing.setup_ms,
+           matmul_timing.convert_ms, matmul_timing.bind_ms,
+           matmul_timing.sync_in_ms, matmul_timing.run_ms,
+           matmul_timing.sync_out_ms, matmul_timing.binary_ms,
+           resize_ms, crop_ms);
 #endif
 
     timer.tik();
@@ -917,6 +1054,7 @@ char *seg_cls_to_name(int cls_id)
 
 void seg_deinit_post_process()
 {
+    release_mask_matmul();
     for (int i = 0; i < OBJ_CLASS_NUM; i++)
     {
         {

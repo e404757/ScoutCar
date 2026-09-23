@@ -39,8 +39,8 @@ perception_node:
     road_tracking.min_valid_rows: 60
     
     road_tracking.front_reference_x: 315
-    road_tracking.turn_left_reference_x: 355
-    road_tracking.turn_right_reference_x: 291
+    road_tracking.turn_left_reference_x: 365
+    road_tracking.turn_right_reference_x: 301
 
     detect.confidence_threshold: 0.8
     detect.nms_threshold: 0.45
