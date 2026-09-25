@@ -17,6 +17,7 @@
 #include "easy_timer.h"
 
 #include <chrono>
+#include <cmath>
 #include <set>
 #include <vector>
 // #define USE_FP_RESIZE 0
@@ -460,6 +461,17 @@ static void convert_mask_input_fp16(const float *src, void *dst_data, int count)
     for (; i < count; ++i) dst[i] = src[i];
 }
 
+// 量化 proto 直接反量化到 MatMul 的 FP16 B 缓冲区，省去 float32 中间数组。
+__attribute__((target("arch=armv8.2-a+fp16"), optimize("O3")))
+static void convert_quant_proto_fp16(const int8_t *src, void *dst_data,
+                                     int count, int32_t zero_point, float scale)
+{
+    auto *dst = static_cast<__fp16 *>(dst_data);
+    for (int i = 0; i < count; ++i) {
+        dst[i] = (static_cast<float>(src[i]) - static_cast<float>(zero_point)) * scale;
+    }
+}
+
 struct SegMaskMatmulTiming {
     double setup_ms = 0;
     double convert_ms = 0;
@@ -480,8 +492,10 @@ static void release_mask_matmul()
 }
 
 static int matmul_by_npu_uint8(const std::vector<float> &coefficients,
-                              const float *proto, uint8_t *mask,
-                              int boxes_num, SegMaskMatmulTiming *timing)
+                              const float *proto, const int8_t *quant_proto,
+                              int32_t proto_zero_point, float proto_scale,
+                              uint8_t *mask, int boxes_num,
+                              SegMaskMatmulTiming *timing)
 {
     using Clock = std::chrono::steady_clock;
     const auto ms = [](Clock::time_point a, Clock::time_point b) {
@@ -524,10 +538,15 @@ static int matmul_by_npu_uint8(const std::vector<float> &coefficients,
                             boxes_num * k);
     auto *a = static_cast<__fp16 *>(mask_matmul.a->virt_addr);
     for (int i = boxes_num * k; i < mask_matmul.capacity * k; ++i) a[i] = 0.0f;
-    convert_mask_input_fp16(proto, mask_matmul.b->virt_addr, k * n);
+    if (quant_proto) {
+        convert_quant_proto_fp16(quant_proto, mask_matmul.b->virt_addr,
+                                 k * n, proto_zero_point, proto_scale);
+    } else {
+        convert_mask_input_fp16(proto, mask_matmul.b->virt_addr, k * n);
+    }
     const auto t_convert = Clock::now();
 
-    // B 在绑定时被 runtime 处理；每帧更新 proto 后必须重新绑定 B。
+    // 每帧更新 proto 后重新绑定 B，保留现有正确路径。
     int bind_ret = RKNN_SUCC;
     if (created) bind_ret = rknn_matmul_set_io_mem(mask_matmul.ctx, mask_matmul.a, &mask_matmul.attr.A);
     if (bind_ret == RKNN_SUCC) bind_ret = rknn_matmul_set_io_mem(mask_matmul.ctx, mask_matmul.b, &mask_matmul.attr.B);
@@ -536,7 +555,6 @@ static int matmul_by_npu_uint8(const std::vector<float> &coefficients,
         release_mask_matmul();
         return bind_ret;
     }
-
     const auto t_bind = Clock::now();
     int ret = rknn_mem_sync(mask_matmul.ctx, mask_matmul.a, RKNN_MEMORY_SYNC_TO_DEVICE);
     if (ret != RKNN_SUCC) return ret;
@@ -624,13 +642,7 @@ static int process_i8(rknn_output *all_input, int input_id, int *anchor, int gri
 
     if (input_id == 6)
     {
-        int8_t *input_proto = (int8_t *)all_input[input_id].buf;
-        int32_t zp_proto = app_ctx->output_attrs[input_id].zp;
-        float scale_proto = app_ctx->output_attrs[input_id].scale;
-        for (int i = 0; i < PROTO_CHANNEL * PROTO_HEIGHT * PROTO_WEIGHT; i++)
-        {
-            proto[i] = deqnt_affine_to_f32(input_proto[i], zp_proto, scale_proto);
-        }
+        // 有候选框时，proto 在 MatMul 输入准备阶段直接写入 FP16 B。
         return validCount;
     }
 
@@ -836,8 +848,8 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     memset(od_results, 0, sizeof(seg_object_detect_result_list));
 
     // 1.解析模型输出
-    // double parse_stage_ms[4] = {};  // 依次存输出 0、2、4、6 的耗时
-    // int parse_stage_valid[3] = {};  // 输出 0、2、4 各产生多少候选框
+    double parse_stage_ms[4] = {};  // 依次存输出 0、2、4、6 的耗时
+    int parse_stage_valid[3] = {};  // 输出 0、2、4 各产生多少候选框
     for (int i = 0; i < 7; i++)
     {
         grid_h = app_ctx->output_attrs[i].dims[2];
@@ -874,13 +886,13 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
         od_results->raw_class_score[k] = raw_class_score[k];
 
     const auto t_parse = Clock::now();
-    // printf(
-    // "Seg parse: det0=%.2f(%d) det2=%.2f(%d) "
-    // "det4=%.2f(%d) proto=%.2f total=%.2f ms\n",
-    // parse_stage_ms[0], parse_stage_valid[0],
-    // parse_stage_ms[1], parse_stage_valid[1],
-    // parse_stage_ms[2], parse_stage_valid[2],
-    // parse_stage_ms[3], ms(t0, t_parse));
+    printf(
+        "Seg parse: det0=%.2f(%d) det2=%.2f(%d) "
+        "det4=%.2f(%d) proto=%.2f total=%.2f ms\n",
+        parse_stage_ms[0], parse_stage_valid[0],
+        parse_stage_ms[1], parse_stage_valid[1],
+        parse_stage_ms[2], parse_stage_valid[2],
+        parse_stage_ms[3], ms(t0, t_parse));
 
     // 2.nms
     if (validCount <= 0)
@@ -1001,9 +1013,12 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     // 只在 NPU 上计算矩阵，保持后续 uint8 resize/crop 路径不变。
     uint8_t *matmul_out = (uint8_t *)malloc(boxes_num * PROTO_HEIGHT * PROTO_WEIGHT * sizeof(uint8_t));
     SegMaskMatmulTiming matmul_timing;
-    const int matmul_ret = matmul_by_npu_uint8(filterSegments_by_nms, proto,
-                                               matmul_out, boxes_num,
-                                               &matmul_timing);
+    const int8_t *quant_proto = app_ctx->is_quant
+        ? static_cast<const int8_t *>(outputs[6].buf) : nullptr;
+    const int matmul_ret = matmul_by_npu_uint8(
+        filterSegments_by_nms, proto, quant_proto,
+        app_ctx->output_attrs[6].zp, app_ctx->output_attrs[6].scale,
+        matmul_out, boxes_num, &matmul_timing);
     if (matmul_ret != 0) {
         free(matmul_out);
         return matmul_ret;
