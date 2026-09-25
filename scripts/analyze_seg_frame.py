@@ -2,7 +2,7 @@
 """对一帧前视画面复现 YOLOv5-seg 后处理，定位 road/barrier 丢失阶段。
 
 依赖: 板上的 rknn-toolkit2、OpenCV、NumPy。--live 还需要 source ROS 2 环境。
-输出: report.json、候选框图、当前/修正 NMS 框图与重建掩码图。
+输出: report.json、候选框图、修复前/修复后 NMS 框图与重建掩码图。
 """
 
 import argparse
@@ -285,8 +285,8 @@ def main() -> None:
     corrected_mask = make_mask(corrected, candidates, coefficients, outputs[6][0], transform)
     cv2.imwrite(str(args.output_dir / "candidates.png"),
                 draw_boxes(frame, candidates, list(range(len(candidates))), transform))
-    for name, indices, mask in (("current", current, current_mask),
-                                ("corrected", corrected, corrected_mask)):
+    for name, indices, mask in (("before_fix", current, current_mask),
+                                ("after_fix", corrected, corrected_mask)):
         cv2.imwrite(str(args.output_dir / f"{name}_boxes.png"),
                     draw_boxes(frame, candidates, indices, transform))
         cv2.imwrite(str(args.output_dir / f"{name}_mask.png"), mask)
@@ -297,19 +297,19 @@ def main() -> None:
               "nms": NMS_THRESHOLD}, "transform": transform,
               "note": "独立 Python RKNN 推理；输出为 float32，边缘数值可能与 C++ INT8 后处理略有差异。",
               "candidates_summary": summarize(list(range(len(candidates))), candidates, transform),
-              "current_summary": summarize(current, candidates, transform),
-              "corrected_summary": summarize(corrected, candidates, transform),
-              "candidate_boxes": candidates, "current_nms_ids": current,
-              "corrected_nms_ids": corrected,
-              "current_removed": current_removed,
-              "corrected_removed": corrected_removed,
-              "cross_class_removed": [item for item in current_removed if item["cross_class"]],
+              "before_fix_summary": summarize(current, candidates, transform),
+              "after_fix_summary": summarize(corrected, candidates, transform),
+              "candidate_boxes": candidates, "before_fix_nms_ids": current,
+              "after_fix_nms_ids": corrected,
+              "before_fix_removed": current_removed,
+              "after_fix_removed": corrected_removed,
+              "cross_class_removed_before_fix": [item for item in current_removed if item["cross_class"]],
               "mask_changed_pixels": int(np.count_nonzero(current_mask != corrected_mask))}
     (args.output_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False,
                                                        indent=2) + "\n")
     print(json.dumps({key: report[key] for key in
-                      ("candidates_summary", "current_summary", "corrected_summary",
-                       "cross_class_removed", "mask_changed_pixels")}, ensure_ascii=False, indent=2))
+                      ("candidates_summary", "before_fix_summary", "after_fix_summary",
+                       "cross_class_removed_before_fix", "mask_changed_pixels")}, ensure_ascii=False, indent=2))
     print(f"结果目录: {args.output_dir}")
 
 

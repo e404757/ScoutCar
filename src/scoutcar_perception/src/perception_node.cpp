@@ -48,7 +48,7 @@ public:
     const auto package_share =
         ament_index_cpp::get_package_share_directory("scoutcar_perception");
     seg_model_path_ = declare_parameter<std::string>(
-        "seg_model_path", package_share + "/models/yolov5_seg/V2.0/seg_V2.0_int8.rknn");
+        "seg_model_path", package_share + "/models/yolov5_seg/V2.0/seg_V2.0.rknn");
     seg_label_path_ = declare_parameter<std::string>(
         "seg_label_path", package_share + "/models/yolov5_seg/V1.0/seg_label.txt");
     scoutcar_perception::SegmentationConfig segmentation_config;
