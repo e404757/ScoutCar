@@ -14,6 +14,7 @@
 
 #include <scoutcar_msgs/msg/road_deviation.hpp>
 #include <scoutcar_msgs/msg/recon_result.hpp>
+#include <scoutcar_msgs/msg/detect_task.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_msgs/msg/u_int8.hpp>
@@ -47,7 +48,7 @@ public:
     const auto package_share =
         ament_index_cpp::get_package_share_directory("scoutcar_perception");
     seg_model_path_ = declare_parameter<std::string>(
-        "seg_model_path", package_share + "/models/yolov5_seg/V1.0/seg_V1.0.rknn");
+        "seg_model_path", package_share + "/models/yolov5_seg/V2.0/seg_V2.0_int8.rknn");
     seg_label_path_ = declare_parameter<std::string>(
         "seg_label_path", package_share + "/models/yolov5_seg/V1.0/seg_label.txt");
     scoutcar_perception::SegmentationConfig segmentation_config;
@@ -113,6 +114,20 @@ public:
     road_tracker_ =
         std::make_unique<road_tracking::RoadTracker>(tracking_config);
 
+    //读取「挡板拼满整行」参数（接近侦察点的自动触发判据）
+    blocked_window_bottom_ratio_ = declare_parameter<double>(
+        "blocked_detect.window_bottom_ratio", 0.6);
+    blocked_config_.required_rows =
+        declare_parameter<int>("blocked_detect.required_rows", 30);
+    blocked_config_.min_barrier_width_px =
+        tracking_config.min_barrier_width_px;//复用 road_tracking 的挡板宽度过滤
+    blocked_config_.edge_tolerance_px =
+        declare_parameter<int>("blocked_detect.edge_tolerance_px", 20);
+    blocked_rearm_absent_frames_ =
+        declare_parameter<int>("blocked_detect.rearm_absent_frames", 30);
+    blocked_auto_exit_s_ =
+        declare_parameter<double>("blocked_detect.auto_exit_s", 5.0);
+
     build_ipm_matrices();
 
     pub_deviation_ = create_publisher<scoutcar_msgs::msg::RoadDeviation>(
@@ -128,6 +143,8 @@ public:
         "perception/turn_detection_image", debug_qos);
     pub_recon_result_ = create_publisher<scoutcar_msgs::msg::ReconResult>(
       "perception/recon_result", 10);
+    pub_detect_task_ = create_publisher<scoutcar_msgs::msg::DetectTask>(
+      "mission/detect_task", 10);
     const auto status_qos =
         rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
     sub_btp_debug_cmd_ = create_subscription<std_msgs::msg::UInt8>(
@@ -164,6 +181,7 @@ public:
           detect_active_ = next_detect_active;
           mission_state_ = msg->mission_state;
           turn_camera_pose_ = msg->turn_camera_pose;
+          in_tunnel_ = msg->in_tunnel != 0;
         });
     sub_turn_image_ = create_subscription<sensor_msgs::msg::Image>(
         "/camera/turn/image_raw",
@@ -369,6 +387,12 @@ private:
                         &result);
     }
 
+    // 挡板拼满整行 → 自动进入侦察（仅前视相机、仅巡航、非侦察中、非隧道内）
+    if (!use_turn_camera && !detect_active_ && !in_tunnel_ &&
+        mission_state_ == scoutcar_msgs::msg::CarState::DRIVING) {
+      check_blocked_detect(ipm_mask.data, seg_result.width, seg_result.height);
+    }
+
     if (make_debug) {
       publish_debug_images(*msg, seg_result.mask.data(), ipm_mask.data,
                            selected_mask.data(), result, reference_x,
@@ -507,6 +531,72 @@ private:
       result.right_valid, static_cast<unsigned>(result.right_result));
   }
 
+  // 挡板从左到右把整行拼满，且从窗口下沿向上连续足够多行 → 判定接近侦察点，
+  // 发布一次 START 进入 DETECTING，并arm 超时退出。只在门控通过时被调用。
+  void check_blocked_detect(const uint8_t * ipm_mask, int width, int height) {
+    road_tracking::BlockedRowConfig config = blocked_config_;
+    config.window_bottom_y =
+        static_cast<int>(blocked_window_bottom_ratio_ * height);
+
+    const auto blocked =
+        road_tracking::scan_blocked_rows(ipm_mask, width, height, config);
+    const bool fired = blocked.consecutive_rows >= config.required_rows;
+
+    if (blocked.consecutive_rows > 0) {
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "挡板拼满候选：连续=%d 行 y=%d 左=%d 右=%d 夹缝路面宽=%d",
+          blocked.consecutive_rows, blocked.row_y, blocked.left_x,
+          blocked.right_x, blocked.max_gap);
+    }
+
+    if (fired && !blocked_latch_) {
+      blocked_latch_ = true;
+      blocked_clear_frames_ = 0;
+      scoutcar_msgs::msg::DetectTask cmd;
+      cmd.status = scoutcar_msgs::msg::DetectTask::START;
+      pub_detect_task_->publish(cmd);
+      arm_auto_detect_exit_timer();
+      RCLCPP_INFO(
+          get_logger(),
+          "挡板拼满整行 %d 行（y=%d 左=%d 右=%d 夹缝路面宽=%d），自动进入侦察",
+          blocked.consecutive_rows, blocked.row_y, blocked.left_x,
+          blocked.right_x, blocked.max_gap);
+      return;
+    }
+
+    // 重臂：只能靠判据持续消失，不能靠"离开 DETECTING"——否则回到巡航时
+    // 挡板还在视野里会立刻再次触发。
+    if (blocked_latch_ && !fired &&
+        ++blocked_clear_frames_ >= blocked_rearm_absent_frames_) {
+      blocked_latch_ = false;
+      blocked_clear_frames_ = 0;
+      RCLCPP_INFO(get_logger(), "挡板拼满已连续 %d 帧消失，重新允许自动触发",
+                  blocked_rearm_absent_frames_);
+    }
+  }
+
+  void arm_auto_detect_exit_timer() {
+    if (auto_detect_exit_timer_) {
+      auto_detect_exit_timer_->cancel();
+      auto_detect_exit_timer_.reset();
+    }
+    auto_detect_exit_timer_ = create_wall_timer(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(blocked_auto_exit_s_)),
+        [this]() {
+          auto_detect_exit_timer_->cancel();
+          if (mission_state_ != scoutcar_msgs::msg::CarState::DETECTING) {
+            return;//mission 已自行退出（到达直行段终点 / 进入 BTP），不补发
+          }
+          scoutcar_msgs::msg::DetectTask cmd;
+          cmd.status = scoutcar_msgs::msg::DetectTask::AUTO_END;
+          pub_detect_task_->publish(cmd);
+          RCLCPP_INFO(get_logger(), "自动侦察 %.1f 秒到期，发布 AUTO_END",
+                      blocked_auto_exit_s_);
+        });
+  }
+
   void publish_deviation(
       const std_msgs::msg::Header &header, uint8_t status,
       const road_tracking::Result *result = nullptr) {
@@ -562,8 +652,18 @@ private:
   uint8_t mission_state_ = scoutcar_msgs::msg::CarState::FINISHED;
   uint8_t turn_camera_pose_ = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
   bool detect_active_ = false;
+  bool in_tunnel_ = false;
   ReconSideLock left_recon_lock_;
   ReconSideLock right_recon_lock_;
+
+  road_tracking::BlockedRowConfig blocked_config_;
+  double blocked_window_bottom_ratio_ = 0.6;
+  int blocked_rearm_absent_frames_ = 30;
+  double blocked_auto_exit_s_ = 5.0;
+  bool blocked_latch_ = false;      // 已触发，禁止重复发布 START
+  int blocked_clear_frames_ = 0;    // 闭锁期间判据连续不成立的帧数
+  rclcpp::TimerBase::SharedPtr auto_detect_exit_timer_;
+  rclcpp::Publisher<scoutcar_msgs::msg::DetectTask>::SharedPtr pub_detect_task_;
 
   rclcpp::Subscription<scoutcar_msgs::msg::CarState>::SharedPtr sub_mission_state_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr sub_btp_debug_cmd_;

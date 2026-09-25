@@ -1,0 +1,17 @@
+[Unit]
+Description=CityScout cameras
+Wants=network-online.target rkaiq_3A.service
+After=network-online.target rkaiq_3A.service
+
+[Service]
+User=root
+Group=root
+Type=simple
+WorkingDirectory=/home/orangepi/CityScout
+ExecStart=/bin/bash -lc 'source /home/orangepi/CityScout/deploy/env.sh && exec ros2 launch scoutcar_bringup cameras.launch.py'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

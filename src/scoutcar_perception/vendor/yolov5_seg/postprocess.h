@@ -17,9 +17,7 @@
 #define PROTO_CHANNEL 32
 #define PROTO_HEIGHT 160
 #define PROTO_WEIGHT 160
-
-// 训练预处理: 裁剪顶部 CROP_TOP_PIXELS 像素后拉伸到 640x640 (推理必须一致)
-#define CROP_TOP_PIXELS 120
+#define CROP_TOP_PIXELS 120  // 训练图片来自 640x480 画面的下方 640x360
 
 
 

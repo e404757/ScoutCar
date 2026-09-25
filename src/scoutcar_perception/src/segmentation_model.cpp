@@ -94,7 +94,7 @@ SegmentationResult SegmentationModel::infer(const uint8_t *rgb_data, int width,
 
   seg_object_detect_result_list vendor_result{};
   const int ret =
-      inference_yolov5_seg_model_cpu(&impl_->context, &image, &vendor_result);
+      inference_yolov5_seg_model(&impl_->context, &image, &vendor_result);
 
   std::unique_ptr<uint8_t, decltype(&std::free)> mask_guard(
       vendor_result.results_seg[0].seg_mask, &std::free);

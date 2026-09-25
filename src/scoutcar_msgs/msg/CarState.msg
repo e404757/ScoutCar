@@ -24,6 +24,9 @@ int32 segment_goal
 # 当前正在执行的路段下标；无有效路段时设为 -1
 int32 segment_index
 
+# 当前路段是否为隧道边（1=是）；隧道内两侧壁会把掩膜整行铺满，需屏蔽自动侦察触发
+uint8 in_tunnel
+
 uint8 DIRECTION_NONE=0
 uint8 DIRECTION_AHEAD=1
 uint8 DIRECTION_LEFT=2

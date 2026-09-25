@@ -110,6 +110,70 @@ Snack find_best_snack(const uint8_t * row,
   return Snack{-1, -1, 0};
 }
 
+// 单行判据：长度达标的挡板段从左侧贴到右侧，段间夹带的是路面。
+// 也就是整行被"挡板—路面—挡板"拼满；夹带的路面多宽不限，但不允许没有夹缝
+// （整行一大块挡板）或夹缝里是背景。不在这里判断参考中心。
+bool row_is_blocked(const uint8_t * row, int width,
+                    const BlockedRowConfig & config, int & left_x,
+                    int & right_x, int & max_gap) {
+  left_x = -1;
+  right_x = -1;
+  max_gap = 0;
+  int prev_end = -1;
+  bool has_gap = false;      // 必须真的存在夹缝，整行一大块挡板不算
+  bool gaps_are_road = true;
+
+  for (int x = 0; x < width;) {
+    if (row[static_cast<size_t>(x)] != 2) {
+      ++x;
+      continue;
+    }
+
+    const Snack snack = greedy_snack(x, width, row);
+    x = snack.end_x + 1;
+
+    if (snack.length < config.min_barrier_width_px) {//过滤掉过窄的挡板
+      continue;
+    }
+    if (left_x < 0) {
+      left_x = snack.start_x;
+    }
+    if (prev_end >= 0) {
+      //挡板之间必须夹带路面：缝隙里每个像素都得是路面；夹缝为 0
+      //（两段挡板贴死，掩膜里会并成一段）没有路面可夹，不算有效
+      const int gap = snack.start_x - prev_end - 1;
+      max_gap = std::max(max_gap, gap);
+      has_gap = true;
+      if (gap <= 0) {
+        gaps_are_road = false;
+      } else {
+        for (int gap_x = prev_end + 1; gap_x < snack.start_x; ++gap_x) {
+          if (row[static_cast<size_t>(gap_x)] != 1) {
+            gaps_are_road = false;
+            break;
+          }
+        }
+      }
+    }
+    prev_end = snack.end_x;
+    right_x = snack.end_x;
+  }
+
+  if (left_x < 0) {
+    return false;
+  }
+  if (left_x > config.edge_tolerance_px) {
+    return false;
+  }
+  if (right_x < width - 1 - config.edge_tolerance_px) {
+    return false;
+  }
+  if (!has_gap || !gaps_are_road) {
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 RoadTracker::RoadTracker(const Config & config) : config_(config) {}
@@ -199,6 +263,36 @@ Result RoadTracker::process(const uint8_t * mask, int width, int height,
         std::max(0, best_snack.start_x - search_expand_px);
     search_end_x =
         std::min(width - 1, best_snack.end_x + search_expand_px);
+  }
+
+  return result;
+}
+
+BlockedRowResult scan_blocked_rows(const uint8_t * mask, int width, int height,
+                                   const BlockedRowConfig & config) {
+  BlockedRowResult result;
+  if (!mask || width <= 0 || height <= 0) {
+    return result;
+  }
+
+  // 从窗口下沿向图像上方（y 减小）连续计数，遇到第一行不满足就停。
+  const int bottom = std::clamp(config.window_bottom_y, 0, height - 1);
+
+  for (int y = bottom; y >= 0; --y) {
+    const uint8_t * row =
+        mask + static_cast<size_t>(y) * static_cast<size_t>(width);
+    int left_x = -1;
+    int right_x = -1;
+    int max_gap = 0;
+    if (!row_is_blocked(row, width, config, left_x, right_x, max_gap)) {
+      break;
+    }
+
+    ++result.consecutive_rows;
+    result.row_y = y;
+    result.left_x = left_x;
+    result.right_x = right_x;
+    result.max_gap = max_gap;
   }
 
   return result;

@@ -53,6 +53,9 @@ public:
     planner_.setConfig(cfg_);
 
     route_mode_ = declare_parameter<std::string>("route_mode", "auto");
+    //隧道屏蔽往前看几段：0=只看当前段；隧道两侧壁在进洞前就会出现在画面里时调大
+    tunnel_lookahead_segments_ =
+      declare_parameter<int>("tunnel_lookahead_segments", 0);
     const auto route_nodes =
       declare_parameter<std::vector<int64_t>>(
         "route_nodes", std::vector<int64_t>{});
@@ -312,6 +315,21 @@ private:
           RCLCPP_INFO(get_logger(), "侦察相机回正完成，恢复巡航");
         });
       RCLCPP_INFO(get_logger(), "结束侦察：两路相机复位，等待 0.5 秒");
+      return;
+    }
+
+    if (status == scoutcar_msgs::msg::DetectTask::AUTO_END) {
+      if (car_state_.mission_state != scoutcar_msgs::msg::CarState::DETECTING) {
+        RCLCPP_WARN(get_logger(), "自动结束侦察：当前未在侦察，忽略");
+        return;
+      }
+      //两路相机都回正（巡航状态的不变量），并直接恢复巡航
+      car_state_.mission_state = scoutcar_msgs::msg::CarState::DRIVING;
+      car_state_.front_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+      car_state_.turn_camera_pose = scoutcar_msgs::msg::CarState::DIRECTION_AHEAD;
+      publish_car_state();
+      pub_base_cmd_->publish(car_state_);
+      RCLCPP_INFO(get_logger(), "自动侦察结束，相机回正，恢复巡航");
     }
   }
 
@@ -461,8 +479,27 @@ private:
     publish_car_state();
   }
 
+  bool current_segment_is_tunnel() const
+  {
+    //当前段，以及其后 tunnel_lookahead_segments_ 段内是否出现隧道边
+    for (int k = 0; k <= tunnel_lookahead_segments_; ++k) {
+      const int index = car_state_.segment_index + k;
+      if (index < 0 || static_cast<size_t>(index) >= segments_.size()) {
+        break;
+      }
+      const mission::Edge edge =
+        mission::normEdge(segments_[index].start, segments_[index].goal);
+      if (std::find(kTunnels.begin(), kTunnels.end(), edge) != kTunnels.end()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void publish_car_state()
   {
+    //隧道内两侧壁会把掩膜整行铺满，感知侧据此屏蔽自动侦察触发
+    car_state_.in_tunnel = current_segment_is_tunnel() ? 1 : 0;
     car_state_.route_nodes = route_nodes_;
     car_state_.route_segment_offset = route_segment_offset_;
     car_state_.header.stamp = now();
@@ -629,6 +666,7 @@ private:
   std::vector<int32_t> route_nodes_;
   int32_t route_segment_offset_ = 0;
   std::string route_mode_;
+  int tunnel_lookahead_segments_ = 0;
   std::vector<int> fixed_route_;
 
 

@@ -42,6 +42,13 @@ perception_node:
     road_tracking.turn_left_reference_x: 365
     road_tracking.turn_right_reference_x: 301
 
+    # 挡板拼满整行 → 自动进入侦察（y=479 最靠近车，y 越小越远）
+    blocked_detect.window_bottom_ratio: 0.7   # 扫描窗口下沿 = 本值 × 图像高（y=479 最靠近车，y 越小越远）
+    blocked_detect.required_rows: 30          # 从下沿向上需要连续满足的行数
+    blocked_detect.edge_tolerance_px: 20      # 左右贴边容差（右段盖不满整行时调大）
+    blocked_detect.rearm_absent_frames: 30    # 判据连续消失多少帧后才允许再次触发
+    blocked_detect.auto_exit_s: 3.0          # 进入侦察后多久自动退出
+
     detect.confidence_threshold: 0.8
     detect.nms_threshold: 0.45
 
@@ -52,6 +59,9 @@ mission_node:
     u_turn_penalty: 1.0
     tunnel_risk: 0.0
     route_mode: "auto"
+    # 隧道屏蔽往前看几段（0=只看当前段）。隧道两侧壁在进洞前就会出现在画面里、
+    # 导致进洞前误触发时，调成 1 或 2。
+    tunnel_lookahead_segments: 0
     route_nodes: [
       1,3,2,6,7,11,10,14,15,19,18,14,15,11,10,6,7,8,12,11,7,6,5,9,10,14,15,11,12,16,15,14,10,9,13,14,18,19,20,16,15,11,10,6,7,4,3,1
     ]

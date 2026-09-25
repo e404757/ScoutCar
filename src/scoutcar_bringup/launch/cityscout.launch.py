@@ -41,18 +41,6 @@ def generate_launch_description():
                 description="true 启动绘制与 Web 转发；false 使用纯净感知",
             ),
             Node(
-                package="scoutcar_camera",
-                executable="camera_node",
-                name="front_camera_node",
-                **common,
-            ),
-            Node(
-                package="scoutcar_camera",
-                executable="camera_node",
-                name="turn_camera_node",
-                **common,
-            ),
-            Node(
                 package="scoutcar_perception",
                 executable="perception_node",
                 name="perception_node",

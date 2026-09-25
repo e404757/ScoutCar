@@ -563,20 +563,23 @@ static int matmul_by_npu_uint8(const std::vector<float> &coefficients,
     return 0;
 }
 
-//掩膜坐标还原
+// 去掉 letterbox 填充，还原到原图下方的裁剪区域。
 void seg_reverse(uint8_t *seg_mask, uint8_t *seg_mask_real,
-                 int model_in_height, int model_in_width, int ori_in_height, int ori_in_width, int crop_top)
+                 int model_in_height, int model_in_width, int ori_in_height,
+                 int ori_in_width, const letterbox_t *letter_box)
 {
-    int crop_h = ori_in_height - crop_top;
-
-    // 模型掩膜(640x640) 拉伸回裁剪区尺寸 (ori_width x crop_h)
-    uint8_t *resized = (uint8_t *)malloc(ori_in_width * crop_h * sizeof(uint8_t));
-    resize_by_opencv_uint8(seg_mask, model_in_width, model_in_height, 1, resized, ori_in_width, crop_h);
-
-    // 放回原图 (顶部 crop_top 行保持 0)
-    memset(seg_mask_real, 0, ori_in_height * ori_in_width);
-    memcpy(seg_mask_real + crop_top * ori_in_width, resized, crop_h * ori_in_width);
-    free(resized);
+    const int crop_h = ori_in_height - CROP_TOP_PIXELS;
+    const int resized_w = std::min(model_in_width - letter_box->x_pad,
+                                   (int)std::round(ori_in_width * letter_box->scale));
+    const int resized_h = std::min(model_in_height - letter_box->y_pad,
+                                   (int)std::round(crop_h * letter_box->scale_y));
+    cv::Mat model_mask(model_in_height, model_in_width, CV_8U, seg_mask);
+    cv::Mat original_mask(ori_in_height, ori_in_width, CV_8U, seg_mask_real);
+    original_mask.setTo(0);
+    cv::resize(model_mask(cv::Rect(letter_box->x_pad, letter_box->y_pad,
+                                  resized_w, resized_h)),
+               original_mask(cv::Rect(0, CROP_TOP_PIXELS, ori_in_width, crop_h)),
+               cv::Size(ori_in_width, crop_h), 0, 0, cv::INTER_LINEAR);
 }
 //检测框坐标还原
 int box_reverse(int position, int boundary, int pad, float scale)
@@ -833,29 +836,51 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     memset(od_results, 0, sizeof(seg_object_detect_result_list));
 
     // 1.解析模型输出
+    // double parse_stage_ms[4] = {};  // 依次存输出 0、2、4、6 的耗时
+    // int parse_stage_valid[3] = {};  // 输出 0、2、4 各产生多少候选框
     for (int i = 0; i < 7; i++)
     {
         grid_h = app_ctx->output_attrs[i].dims[2];
         grid_w = app_ctx->output_attrs[i].dims[3];
         stride = model_in_height / grid_h;
 
+        const auto stage_begin = Clock::now();
+        int added = 0;
+        if (i == 6 && validCount == 0) {
+            break;
+        }
         if (app_ctx->is_quant)
         {
-            validCount += process_i8(outputs, i, (int *)anchor[i / 2], grid_h, grid_w, model_in_height, model_in_width, stride, filterBoxes, filterSegments, proto, objProbs,
+           added = process_i8(outputs, i, (int *)anchor[i / 2], grid_h, grid_w, model_in_height, model_in_width, stride, filterBoxes, filterSegments, proto, objProbs,
                                      classId, conf_threshold, raw_class_score, app_ctx);
         }
         else
         {
-            validCount += process_fp32(outputs, i, (int *)anchor[i / 2], grid_h, grid_w, model_in_height, model_in_width, stride, filterBoxes, filterSegments, proto, objProbs,
+            added = process_fp32(outputs, i, (int *)anchor[i / 2], grid_h, grid_w, model_in_height, model_in_width, stride, filterBoxes, filterSegments, proto, objProbs,
                                        classId, conf_threshold, raw_class_score);
         }
+        const auto stage_end = Clock::now();
+        validCount += added;
+        if (i % 2 == 0) {
+        parse_stage_ms[i / 2] = ms(stage_begin, stage_end);
+        if (i < 6) {
+                parse_stage_valid[i / 2] = added;
+        }
     }
-    
+    }
 
     // 无论是否为 0，都写回原始每类最高分(供遥测画真实置信度分布)
     for (int k = 0; k < OBJ_CLASS_NUM; ++k)
         od_results->raw_class_score[k] = raw_class_score[k];
+
     const auto t_parse = Clock::now();
+    // printf(
+    // "Seg parse: det0=%.2f(%d) det2=%.2f(%d) "
+    // "det4=%.2f(%d) proto=%.2f total=%.2f ms\n",
+    // parse_stage_ms[0], parse_stage_valid[0],
+    // parse_stage_ms[1], parse_stage_valid[1],
+    // parse_stage_ms[2], parse_stage_valid[2],
+    // parse_stage_ms[3], ms(t0, t_parse));
 
     // 2.nms
     if (validCount <= 0)
@@ -912,6 +937,7 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     }
     od_results->count = last_count;
     const int boxes_num = od_results->count;
+
     const auto t_nms = Clock::now();
 
     //坐标还原
@@ -926,11 +952,21 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
         filterBoxes_by_nms[i * 4 + 3] = od_results->results[i].box.bottom; // y2;
         cls_id[i] = od_results->results[i].cls_id;
 
-        // get real box (crop+stretch 非等比还原: x/scale_x, crop_top + y/scale_y)
-        od_results->results[i].box.left = (int)(clamp((float)od_results->results[i].box.left, 0, model_in_width) / letter_box->scale);
-        od_results->results[i].box.top = (int)(letter_box->y_pad + clamp((float)od_results->results[i].box.top, 0, model_in_height) / letter_box->scale_y);
-        od_results->results[i].box.right = (int)(clamp((float)od_results->results[i].box.right, 0, model_in_width) / letter_box->scale);
-        od_results->results[i].box.bottom = (int)(letter_box->y_pad + clamp((float)od_results->results[i].box.bottom, 0, model_in_height) / letter_box->scale_y);
+        // 去掉填充，映回裁剪区域，再加上原图顶部裁掉的 120 行。
+        od_results->results[i].box.left = clamp(
+            (od_results->results[i].box.left - letter_box->x_pad) / letter_box->scale,
+            0, app_ctx->input_image_width - 1);
+        od_results->results[i].box.top = clamp(
+            CROP_TOP_PIXELS +
+                (od_results->results[i].box.top - letter_box->y_pad) / letter_box->scale_y,
+            CROP_TOP_PIXELS, app_ctx->input_image_height - 1);
+        od_results->results[i].box.right = clamp(
+            (od_results->results[i].box.right - letter_box->x_pad) / letter_box->scale,
+            0, app_ctx->input_image_width - 1);
+        od_results->results[i].box.bottom = clamp(
+            CROP_TOP_PIXELS +
+                (od_results->results[i].box.bottom - letter_box->y_pad) / letter_box->scale_y,
+            CROP_TOP_PIXELS, app_ctx->input_image_height - 1);
     }
 
     TIMER timer;
@@ -1001,13 +1037,13 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
 #endif
 
     timer.tik();
-    // get real mask (crop+stretch 还原)
+    
     int ori_in_height = app_ctx->input_image_height;
     int ori_in_width = app_ctx->input_image_width;
     uint8_t *real_seg_mask = (uint8_t *)malloc(ori_in_height * ori_in_width * sizeof(uint8_t));
     const auto t_mask = Clock::now();
     seg_reverse(all_mask_in_one, real_seg_mask,
-                model_in_height, model_in_width, ori_in_height, ori_in_width, letter_box->y_pad);
+                model_in_height, model_in_width, ori_in_height, ori_in_width, letter_box);
     od_results->results_seg[0].seg_mask = real_seg_mask;
     free(all_mask_in_one);
     free(seg_mask);
@@ -1016,10 +1052,10 @@ int seg_post_process(seg_rknn_app_context_t *app_ctx, rknn_output *outputs, lett
     timer.print_time("seg_reverse");
     const auto t_end = Clock::now();
 
-    // printf("Seg post: valid=%d boxes=%d parse=%.2f nms=%.2f mask=%.2f reverse=%.2f ms\n",
-    //     validCount, boxes_num,
-    //     ms(t0, t_parse), ms(t_parse, t_nms),
-    //     ms(t_nms, t_mask), ms(t_mask, t_end));
+    printf("Seg post: valid=%d boxes=%d parse=%.2f nms=%.2f mask=%.2f reverse=%.2f ms\n",
+        validCount, boxes_num,
+        ms(t0, t_parse), ms(t_parse, t_nms),
+        ms(t_nms, t_mask), ms(t_mask, t_end));
 
     return 0;
 }
